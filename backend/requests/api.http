@@ -1,0 +1,11 @@
+### Base API Check
+GET http://localhost:3000/
+
+### Test Database Write
+POST http://localhost:3000/api/test-db
+Content-Type: application/json
+
+{
+  "name": "Test Entry",
+  "message": "Writing this to Firestore from REST Client!"
+}
