@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword } from "firebase/auth";
 import { auth } from "@/lib/firebase";
+import { syncSession } from "@/components/auth-session-sync";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
@@ -23,12 +24,13 @@ export default function AuthPage() {
     setLoading(true);
     setError(null);
     try {
-      if (isLogin) {
-        await signInWithEmailAndPassword(auth, email, password);
-      } else {
-        await createUserWithEmailAndPassword(auth, email, password);
-      }
-      router.push("/");
+      const credential = isLogin
+        ? await signInWithEmailAndPassword(auth, email, password)
+        : await createUserWithEmailAndPassword(auth, email, password);
+      await syncSession(await credential.user.getIdToken());
+
+      const next = new URLSearchParams(window.location.search).get("next");
+      router.replace(next?.startsWith("/") && !next.startsWith("//") ? next : "/");
     } catch (err: unknown) {
       if (err instanceof Error) {
         setError(err.message);
