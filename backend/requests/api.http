@@ -9,3 +9,53 @@ Content-Type: application/json
   "name": "Test Entry",
   "message": "Writing this to Firestore from REST Client!"
 }
+
+### Add New Novel (Valid Draft Request)
+POST http://localhost:3000/api/novel/add
+Content-Type: application/json
+
+{
+  "title": "test-novel-3",
+  "author": "Rollie Garcia",
+  "description": "test description.",
+  "status": "draft",
+  "metadata": {
+    "tags": ["sci-fi", "adventure", "technology"],
+    "coverImage": "https://example.com/covers.jpg",
+    "totalWords": 5550
+  },
+  "episodes": [
+    {
+      "episodeNumber": 1,
+      "title": "Episode 1: The First Compile",
+      "summary": "Our protagonist boots the editor for the first time.",
+      "published": false,
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "title": "Chapter 1:",
+          "content": "In the beginning, there...",
+          "wordCount": 2450,
+          "notes": "Introductory chapter."
+        },
+        {
+          "chapterNumber": 2,
+          "title": "Chapter 2: hello",
+          "content": "content-2",
+          "wordCount": 3100,
+          "notes": "Action-packed blablabla."
+        }
+      ]
+    }
+  ]
+}
+
+### Add New Novel (Validation Failure Example)
+POST http://localhost:3000/api/novel/add
+Content-Type: application/json
+
+{
+  "title": "",
+  "author": "Rollie Garcia",
+  "status": "invalid-status"
+}
