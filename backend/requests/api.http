@@ -84,3 +84,28 @@ GET http://localhost:3000/api/novel
 
 ### Get All Episodes in a Novel
 GET http://localhost:3000/api/novel/replace_with_novel_id/episodes
+
+### Get All Chapters in an Episode
+GET http://localhost:3000/api/novel/5xObs1atoESdHhCwLtDr/episodes/1/chapters
+
+### Add New Chapter to an Episode
+POST http://localhost:3000/api/novel/5xObs1atoESdHhCwLtDr/episodes/1/chapters
+Content-Type: application/json
+
+{
+  "title": "Chapter 2: The Next Step",
+  "content": "Continuing the journey...",
+  "wordCount": 1200,
+  "notes": "Added via POST chapter API"
+}
+
+### Update an Existing Chapter in an Episode
+PUT http://localhost:3000/api/novel/5xObs1atoESdHhCwLtDr/episodes/1/chapters/1
+Content-Type: application/json
+
+{
+  "title": "Chapter 1: The Arrival (Revised)",
+  "content": "They arrived at dawn, and it was glorious...",
+  "wordCount": 1600,
+  "notes": "Revised introductory chapter"
+}

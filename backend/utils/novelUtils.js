@@ -136,3 +136,45 @@ export function buildEpisodeObject(body) {
     })),
   };
 }
+
+/**
+ * Validates a chapter payload.
+ *
+ * @param {object} body - The parsed request body for the chapter.
+ * @returns {string[]} Array of validation error messages.
+ */
+export function validateChapterPayload(body) {
+  const errors = [];
+
+  if (body.title !== undefined && typeof body.title !== 'string') {
+    errors.push('\`title\` must be a string.');
+  }
+
+  if (body.content !== undefined && typeof body.content !== 'string') {
+    errors.push('\`content\` must be a string.');
+  }
+
+  if (body.chapterNumber !== undefined && typeof body.chapterNumber !== 'number') {
+    errors.push('\`chapterNumber\` must be a number.');
+  }
+
+  return errors;
+}
+
+/**
+ * Builds a chapter object from the validated request body.
+ *
+ * @param {object} body - The validated, parsed request body.
+ * @returns {object} The chapter object.
+ */
+export function buildChapterObject(body) {
+  const fallbackDate = new Date().toISOString();
+  return {
+    chapterNumber: body.chapterNumber ?? 1,
+    title: body.title ?? '',
+    content: body.content ?? '',
+    wordCount: body.wordCount ?? 0,
+    lastEdited: body.lastEdited ?? fallbackDate,
+    notes: body.notes ?? '',
+  };
+}
