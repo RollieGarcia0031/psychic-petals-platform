@@ -178,5 +178,43 @@ router.post('/:id/episodes', async (req, res) => {
     });
   }
 });
+// ---------------------------------------------------------------------------
+// GET /api/novel/:id/episodes  –  Get all episodes of a novel
+// ---------------------------------------------------------------------------
+
+/**
+ * @route   GET /api/novel/:id/episodes
+ * @desc    Get all episodes of a specific novel.
+ */
+router.get('/:id/episodes', async (req, res) => {
+  const novelId = req.params.id;
+
+  try {
+    const novelRef = db.collection('novels').doc(novelId);
+    const doc = await novelRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: 'Novel not found.',
+      });
+    }
+
+    const novelData = doc.data();
+    const episodes = novelData.episodes || [];
+
+    return res.status(200).json({
+      success: true,
+      episodes,
+    });
+  } catch (error) {
+    console.error(`[GET /api/novel/${novelId}/episodes] Error fetching episodes:`, error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch episodes.',
+      error: error.message,
+    });
+  }
+});
 
 export default router;
