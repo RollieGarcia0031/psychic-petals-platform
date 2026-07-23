@@ -59,3 +59,28 @@ Content-Type: application/json
   "author": "Rollie Garcia",
   "status": "invalid-status"
 }
+
+### Add New Episode to Novel
+POST http://localhost:3000/api/novel/replace_with_novel_id/episodes
+Content-Type: application/json
+
+{
+  "title": "Episode 2: The Next Phase",
+  "summary": "The journey continues into new territories.",
+  "published": true,
+  "chapters": [
+    {
+      "chapterNumber": 1,
+      "title": "Chapter 1: The Arrival",
+      "content": "They arrived at dawn...",
+      "wordCount": 1500,
+      "notes": "Remember to introduce the new character."
+    }
+  ]
+}
+
+### Get List of All Novels
+GET http://localhost:3000/api/novel
+
+### Get All Episodes in a Novel
+GET http://localhost:3000/api/novel/replace_with_novel_id/episodes

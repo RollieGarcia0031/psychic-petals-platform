@@ -88,3 +88,51 @@ export function buildNovelDocument(body) {
     metadata,
   };
 }
+
+/**
+ * Validates an episode payload.
+ *
+ * @param {object} body - The parsed request body for the episode.
+ * @returns {string[]} Array of validation error messages.
+ */
+export function validateEpisodePayload(body) {
+  const errors = [];
+
+  if (body.title !== undefined && typeof body.title !== 'string') {
+    errors.push('`title` must be a string.');
+  }
+  
+  if (body.episodeNumber !== undefined && typeof body.episodeNumber !== 'number') {
+    errors.push('`episodeNumber` must be a number.');
+  }
+
+  if (body.chapters !== undefined && !Array.isArray(body.chapters)) {
+    errors.push('`chapters` must be an array.');
+  }
+
+  return errors;
+}
+
+/**
+ * Builds an episode object from the validated request body.
+ *
+ * @param {object} body - The validated, parsed request body.
+ * @returns {object} The episode object.
+ */
+export function buildEpisodeObject(body) {
+  const fallbackDate = new Date().toISOString();
+  return {
+    episodeNumber: body.episodeNumber ?? 1,
+    title: body.title ?? '',
+    summary: body.summary ?? '',
+    published: body.published ?? false,
+    chapters: (body.chapters ?? []).map((ch, chIdx) => ({
+      chapterNumber: ch.chapterNumber ?? chIdx + 1,
+      title: ch.title ?? '',
+      content: ch.content ?? '',
+      wordCount: ch.wordCount ?? 0,
+      lastEdited: ch.lastEdited ?? fallbackDate,
+      notes: ch.notes ?? '',
+    })),
+  };
+}
