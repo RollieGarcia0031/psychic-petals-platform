@@ -3,7 +3,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
-import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 
 const NOVEL_ID = 'psychic_petals';
@@ -175,10 +175,19 @@ async function readChangedChapters(novelDir, changedFiles) {
 function initializeFirestore() {
   if (getApps().length > 0) return getFirestore();
 
-  const inlineCredentials = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  const credential = inlineCredentials
-    ? cert(JSON.parse(inlineCredentials))
-    : applicationDefault();
+  const encodedKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (!encodedKey) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT_KEY must contain Base64-encoded Firebase service-account JSON.');
+  }
+
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(Buffer.from(encodedKey.replace(/\s/g, ''), 'base64').toString('utf8'));
+  } catch (error) {
+    throw new Error(`FIREBASE_SERVICE_ACCOUNT_KEY is not valid Base64-encoded service-account JSON: ${error.message}`);
+  }
+
+  const credential = cert(serviceAccount);
   return getFirestore(initializeApp({ credential }));
 }
 
