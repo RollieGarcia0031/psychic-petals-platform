@@ -100,56 +100,17 @@ export function countWords(content) {
 }
 
 export function buildUpdatedNovel(currentNovel, chapters, timestamp) {
-  const novel = {
+  return {
     ...DEFAULT_NOVEL,
     ...currentNovel,
     _id: NOVEL_ID,
     createdAt: currentNovel?.createdAt ?? timestamp,
     updatedAt: timestamp,
-    episodes: [...(currentNovel?.episodes ?? [])].map((episode) => ({
-      ...episode,
-      chapters: [...(episode.chapters ?? [])],
-    })),
     metadata: {
       ...DEFAULT_NOVEL.metadata,
       ...(currentNovel?.metadata ?? {}),
     },
   };
-
-  for (const chapter of chapters) {
-    let episode = novel.episodes.find(({ episodeNumber }) => episodeNumber === chapter.episodeNumber);
-    if (!episode) {
-      episode = {
-        episodeNumber: chapter.episodeNumber,
-        title: `Episode ${chapter.episodeNumber}`,
-        summary: '',
-        published: false,
-        chapters: [],
-      };
-      novel.episodes.push(episode);
-    }
-
-    const chapterIndex = episode.chapters.findIndex(
-      ({ chapterNumber }) => chapterNumber === chapter.chapterNumber,
-    );
-    const previousChapter = chapterIndex === -1 ? {} : episode.chapters[chapterIndex];
-    const updatedChapter = { ...previousChapter, ...chapter, lastEdited: timestamp };
-
-    if (chapterIndex === -1) episode.chapters.push(updatedChapter);
-    else episode.chapters[chapterIndex] = updatedChapter;
-  }
-
-  novel.episodes.sort((left, right) => left.episodeNumber - right.episodeNumber);
-  for (const episode of novel.episodes) {
-    episode.chapters.sort((left, right) => left.chapterNumber - right.chapterNumber);
-    episode.totalWords = episode.chapters.reduce((total, chapter) => total + (chapter.wordCount ?? 0), 0);
-  }
-  novel.metadata.totalWords = novel.episodes.reduce(
-    (total, episode) => total + episode.totalWords,
-    0,
-  );
-
-  return novel;
 }
 
 async function readChangedChapters(novelDir, changedFiles) {
@@ -206,11 +167,85 @@ async function main() {
 
   const db = initializeFirestore();
   const novelRef = db.collection('novels').doc(NOVEL_ID);
-  const snapshot = await novelRef.get();
   const timestamp = new Date().toISOString();
-  const novel = buildUpdatedNovel(snapshot.exists ? snapshot.data() : {}, chapters, timestamp);
 
-  await novelRef.set(novel, { merge: true });
+  // Ensure the novel document exists
+  const novelSnapshot = await novelRef.get();
+  if (!novelSnapshot.exists) {
+    const defaultNovelDoc = {
+      title: DEFAULT_NOVEL.title,
+      description: DEFAULT_NOVEL.description,
+      author: DEFAULT_NOVEL.author,
+      status: DEFAULT_NOVEL.status,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      metadata: {
+        ...DEFAULT_NOVEL.metadata,
+      }
+    };
+    await novelRef.set(defaultNovelDoc);
+  }
+
+  // Sync each changed chapter
+  for (const chapter of chapters) {
+    const episodeRef = novelRef.collection('episodes').doc(chapter.episodeNumber.toString());
+    const episodeSnapshot = await episodeRef.get();
+    
+    // If the episode document doesn't exist, create it with default values
+    if (!episodeSnapshot.exists) {
+      await episodeRef.set({
+        episodeNumber: chapter.episodeNumber,
+        title: `Episode ${chapter.episodeNumber}`,
+        summary: '',
+        published: false,
+        totalWords: 0
+      });
+    }
+
+    const chapterRef = episodeRef.collection('chapters').doc(chapter.chapterNumber.toString());
+    const chapterSnapshot = await chapterRef.get();
+    const existingChapterData = chapterSnapshot.exists ? chapterSnapshot.data() : {};
+    
+    const updatedChapter = {
+      ...existingChapterData,
+      chapterNumber: chapter.chapterNumber,
+      title: chapter.title,
+      content: chapter.content,
+      wordCount: chapter.wordCount,
+      lastEdited: timestamp,
+      notes: existingChapterData.notes ?? '',
+      slug: chapter.slug ?? ''
+    };
+    
+    await chapterRef.set(updatedChapter);
+  }
+
+  // Recalculate word counts
+  const episodesSnapshot = await novelRef.collection('episodes').get();
+  let totalWordsNovel = 0;
+
+  for (const epDoc of episodesSnapshot.docs) {
+    const epRef = epDoc.ref;
+    const chaptersSnapshot = await epRef.collection('chapters').get();
+    
+    let totalWordsEpisode = 0;
+    chaptersSnapshot.forEach((chDoc) => {
+      totalWordsEpisode += chDoc.data().wordCount ?? 0;
+    });
+
+    await epRef.update({
+      totalWords: totalWordsEpisode
+    });
+
+    totalWordsNovel += totalWordsEpisode;
+  }
+
+  // Update novel document with total word counts and updatedAt
+  await novelRef.update({
+    'metadata.totalWords': totalWordsNovel,
+    updatedAt: timestamp
+  });
+
   console.log(`Synced ${chapters.length} chapter(s) to novels/${NOVEL_ID}.`);
 }
 

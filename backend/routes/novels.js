@@ -1,5 +1,6 @@
 import express from 'express';
 import { db } from '../config/firebase.js';
+import { FieldValue } from 'firebase-admin/firestore';
 import { validateNovelPayload, buildNovelDocument, validateEpisodePayload, buildEpisodeObject, validateChapterPayload, buildChapterObject } from '../utils/novelUtils.js';
 
 const router = express.Router();
@@ -99,6 +100,33 @@ router.post('/add', async (req, res) => {
 
     // Firestore auto-generates the document ID which acts as `_id`
     const docRef = await db.collection('novels').add(novelDoc);
+    const novelId = docRef.id;
+
+    // Save initial episodes and chapters if any
+    if (Array.isArray(req.body.episodes) && req.body.episodes.length > 0) {
+      const batch = db.batch();
+      
+      req.body.episodes.forEach((ep, epIdx) => {
+        const episodeNumber = ep.episodeNumber ?? (epIdx + 1);
+        const episodeRef = db.collection('novels').doc(novelId).collection('episodes').doc(episodeNumber.toString());
+        const episodeObj = buildEpisodeObject({ ...ep, episodeNumber });
+        
+        // Remove chapters array from the episode document we store
+        const { chapters, ...episodeData } = episodeObj;
+        batch.set(episodeRef, episodeData);
+
+        if (Array.isArray(ep.chapters) && ep.chapters.length > 0) {
+          ep.chapters.forEach((ch, chIdx) => {
+            const chapterNumber = ch.chapterNumber ?? (chIdx + 1);
+            const chapterRef = episodeRef.collection('chapters').doc(chapterNumber.toString());
+            const chapterObj = buildChapterObject({ ...ch, chapterNumber });
+            batch.set(chapterRef, chapterObj);
+          });
+        }
+      });
+
+      await batch.commit();
+    }
 
     return res.status(201).json({
       success: true,
@@ -146,28 +174,54 @@ router.post('/:id/episodes', async (req, res) => {
       });
     }
     
-    // Using FieldValue from firebase-admin requires importing it.
-    // We can also fetch, modify, and update the document.
-    const novelData = doc.data();
-    const episodes = novelData.episodes || [];
+    // Automatically assign episodeNumber if not provided by finding max episodeNumber in episodes subcollection
+    let newEpisodeNumber = req.body.episodeNumber;
+    if (newEpisodeNumber === undefined) {
+      const lastEpisodeSnapshot = await novelRef.collection('episodes')
+        .orderBy('episodeNumber', 'desc')
+        .limit(1)
+        .get();
+      if (!lastEpisodeSnapshot.empty) {
+        newEpisodeNumber = (lastEpisodeSnapshot.docs[0].data().episodeNumber || 0) + 1;
+      } else {
+        newEpisodeNumber = 1;
+      }
+    }
     
-    // Automatically assign episodeNumber if not provided
-    const newEpisodeNumber = req.body.episodeNumber ?? (episodes.length > 0 ? Math.max(...episodes.map(e => e.episodeNumber)) + 1 : 1);
     const episodeData = { ...req.body, episodeNumber: newEpisodeNumber };
-    
-    const newEpisode = buildEpisodeObject(episodeData);
+    const episodeObj = buildEpisodeObject(episodeData);
 
-    episodes.push(newEpisode);
+    const episodeRef = novelRef.collection('episodes').doc(newEpisodeNumber.toString());
+
+    // Save episode document and its initial chapters if any
+    const batch = db.batch();
+    const { chapters, ...epDocData } = episodeObj;
+    batch.set(episodeRef, epDocData);
+
+    const addedChapters = [];
+    if (Array.isArray(chapters) && chapters.length > 0) {
+      chapters.forEach((ch, chIdx) => {
+        const chapterNumber = ch.chapterNumber ?? (chIdx + 1);
+        const chapterRef = episodeRef.collection('chapters').doc(chapterNumber.toString());
+        const chapterObj = buildChapterObject({ ...ch, chapterNumber });
+        batch.set(chapterRef, chapterObj);
+        addedChapters.push(chapterObj);
+      });
+    }
+
+    await batch.commit();
 
     await novelRef.update({
-      episodes: episodes,
-      updatedAt: new Date().toISOString() // Or FieldValue.serverTimestamp() if imported
+      updatedAt: new Date().toISOString()
     });
 
     return res.status(200).json({
       success: true,
       message: 'Episode added successfully.',
-      episode: newEpisode,
+      episode: {
+        ...epDocData,
+        chapters: addedChapters,
+      },
     });
   } catch (error) {
     console.error(`[POST /api/novel/${novelId}/episodes] Error adding episode:`, error);
@@ -200,8 +254,22 @@ router.get('/:id/episodes', async (req, res) => {
       });
     }
 
-    const novelData = doc.data();
-    const episodes = novelData.episodes || [];
+    const episodesSnapshot = await novelRef.collection('episodes').orderBy('episodeNumber').get();
+    
+    const episodes = await Promise.all(
+      episodesSnapshot.docs.map(async (epDoc) => {
+        const epData = epDoc.data();
+        const chaptersSnapshot = await epDoc.ref.collection('chapters').orderBy('chapterNumber').get();
+        const chapters = [];
+        chaptersSnapshot.forEach((chDoc) => {
+          chapters.push(chDoc.data());
+        });
+        return {
+          ...epData,
+          chapters,
+        };
+      })
+    );
 
     return res.status(200).json({
       success: true,
@@ -240,20 +308,25 @@ router.get('/:id/episodes/:episodeNumber/chapters', async (req, res) => {
       });
     }
 
-    const novelData = doc.data();
-    const episodes = novelData.episodes || [];
-    const episode = episodes.find(e => e.episodeNumber === episodeNumber);
+    const episodeRef = novelRef.collection('episodes').doc(episodeNumber.toString());
+    const episodeDoc = await episodeRef.get();
 
-    if (!episode) {
+    if (!episodeDoc.exists) {
       return res.status(404).json({
         success: false,
         message: 'Episode not found.',
       });
     }
 
+    const chaptersSnapshot = await episodeRef.collection('chapters').orderBy('chapterNumber').get();
+    const chapters = [];
+    chaptersSnapshot.forEach(chDoc => {
+      chapters.push(chDoc.data());
+    });
+
     return res.status(200).json({
       success: true,
-      chapters: episode.chapters || [],
+      chapters,
     });
   } catch (error) {
     console.error(`[GET /api/novel/${novelId}/episodes/${episodeNumber}/chapters] Error fetching chapters:`, error);
@@ -297,31 +370,36 @@ router.post('/:id/episodes/:episodeNumber/chapters', async (req, res) => {
       });
     }
 
-    const novelData = doc.data();
-    const episodes = novelData.episodes || [];
-    const episodeIndex = episodes.findIndex(e => e.episodeNumber === episodeNumber);
+    const episodeRef = novelRef.collection('episodes').doc(episodeNumber.toString());
+    const episodeDoc = await episodeRef.get();
 
-    if (episodeIndex === -1) {
+    if (!episodeDoc.exists) {
       return res.status(404).json({
         success: false,
         message: 'Episode not found.',
       });
     }
 
-    const episode = episodes[episodeIndex];
-    const chapters = episode.chapters || [];
-    
     // Automatically assign chapterNumber if not provided
-    const newChapterNumber = req.body.chapterNumber ?? (chapters.length > 0 ? Math.max(...chapters.map(c => c.chapterNumber)) + 1 : 1);
-    const chapterData = { ...req.body, chapterNumber: newChapterNumber };
+    let newChapterNumber = req.body.chapterNumber;
+    if (newChapterNumber === undefined) {
+      const lastChapterSnapshot = await episodeRef.collection('chapters')
+        .orderBy('chapterNumber', 'desc')
+        .limit(1)
+        .get();
+      if (!lastChapterSnapshot.empty) {
+        newChapterNumber = (lastChapterSnapshot.docs[0].data().chapterNumber || 0) + 1;
+      } else {
+        newChapterNumber = 1;
+      }
+    }
     
+    const chapterData = { ...req.body, chapterNumber: newChapterNumber };
     const newChapter = buildChapterObject(chapterData);
 
-    chapters.push(newChapter);
-    episodes[episodeIndex].chapters = chapters;
+    await episodeRef.collection('chapters').doc(newChapterNumber.toString()).set(newChapter);
 
     await novelRef.update({
-      episodes: episodes,
       updatedAt: new Date().toISOString()
     });
 
@@ -373,22 +451,20 @@ router.put('/:id/episodes/:episodeNumber/chapters/:chapterNumber', async (req, r
       });
     }
 
-    const novelData = doc.data();
-    const episodes = novelData.episodes || [];
-    const episodeIndex = episodes.findIndex(e => e.episodeNumber === episodeNumber);
+    const episodeRef = novelRef.collection('episodes').doc(episodeNumber.toString());
+    const episodeDoc = await episodeRef.get();
 
-    if (episodeIndex === -1) {
+    if (!episodeDoc.exists) {
       return res.status(404).json({
         success: false,
         message: 'Episode not found.',
       });
     }
 
-    const episode = episodes[episodeIndex];
-    const chapters = episode.chapters || [];
-    const chapterIndex = chapters.findIndex(c => c.chapterNumber === chapterNumber);
+    const chapterRef = episodeRef.collection('chapters').doc(chapterNumber.toString());
+    const chapterDoc = await chapterRef.get();
 
-    if (chapterIndex === -1) {
+    if (!chapterDoc.exists) {
       return res.status(404).json({
         success: false,
         message: 'Chapter not found.',
@@ -396,18 +472,17 @@ router.put('/:id/episodes/:episodeNumber/chapters/:chapterNumber', async (req, r
     }
 
     const updatedChapterData = {
-      ...chapters[chapterIndex],
+      ...chapterDoc.data(),
       ...req.body,
       chapterNumber: chapterNumber, // keep the path parameter chapterNumber
       lastEdited: new Date().toISOString()
     };
 
     const updatedChapter = buildChapterObject(updatedChapterData);
-    chapters[chapterIndex] = updatedChapter;
-    episodes[episodeIndex].chapters = chapters;
+
+    await chapterRef.set(updatedChapter);
 
     await novelRef.update({
-      episodes: episodes,
       updatedAt: new Date().toISOString()
     });
 

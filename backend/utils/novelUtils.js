@@ -54,28 +54,11 @@ export function validateNovelPayload(body) {
 export function buildNovelDocument(body) {
   const now = FieldValue.serverTimestamp();
 
-  const fallbackDate = new Date().toISOString();
-
   const metadata = {
     tags: body.metadata?.tags ?? [],
     coverImage: body.metadata?.coverImage ?? '',
     totalWords: body.metadata?.totalWords ?? 0,
   };
-
-  const episodes = (body.episodes ?? []).map((ep, epIdx) => ({
-    episodeNumber: ep.episodeNumber ?? epIdx + 1,
-    title: ep.title ?? '',
-    summary: ep.summary ?? '',
-    published: ep.published ?? false,
-    chapters: (ep.chapters ?? []).map((ch, chIdx) => ({
-      chapterNumber: ch.chapterNumber ?? chIdx + 1,
-      title: ch.title ?? '',
-      content: ch.content ?? '',
-      wordCount: ch.wordCount ?? 0,
-      lastEdited: ch.lastEdited ?? fallbackDate,
-      notes: ch.notes ?? '',
-    })),
-  }));
 
   return {
     title: body.title.trim(),
@@ -84,7 +67,6 @@ export function buildNovelDocument(body) {
     status: body.status ?? 'draft',
     createdAt: now,
     updatedAt: now,
-    episodes,
     metadata,
   };
 }
