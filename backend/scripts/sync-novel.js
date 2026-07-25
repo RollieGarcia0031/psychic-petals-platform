@@ -54,9 +54,8 @@ export function parseArguments(argv) {
 /**
  * Convert a story path into its Firestore location.
  *
- * The preferred layout is main/episode-NN/NN-slug.md. The repository also
- * contains the documented nested form main/episode-NN/chapter-NN/file.md,
- * where the chapter directory supplies the chapter number.
+ * Story files use the canonical flat layout main/episode-NN/NN-slug.md.
+ * Both numeric prefixes are required so Firestore locations remain stable.
  */
 export function parseChapterPath(filePath) {
   const normalizedPath = filePath.split(path.sep).join('/');
@@ -69,16 +68,7 @@ export function parseChapterPath(filePath) {
     };
   }
 
-  const nestedMatch = normalizedPath.match(/^main\/episode-(\d+)\/chapter-(\d+)\/([^/]+)\.md$/i);
-  if (!nestedMatch) return null;
-
-  const filename = nestedMatch[3];
-  const numberedFilename = filename.match(/^\d+-(.+)$/);
-  return {
-    episodeNumber: Number.parseInt(nestedMatch[1], 10),
-    chapterNumber: Number.parseInt(nestedMatch[2], 10),
-    slug: numberedFilename ? numberedFilename[1] : filename,
-  };
+  return null;
 }
 
 /** Extract a readable chapter title from the first level-one Markdown heading. */
@@ -100,56 +90,17 @@ export function countWords(content) {
 }
 
 export function buildUpdatedNovel(currentNovel, chapters, timestamp) {
-  const novel = {
+  return {
     ...DEFAULT_NOVEL,
     ...currentNovel,
     _id: NOVEL_ID,
     createdAt: currentNovel?.createdAt ?? timestamp,
     updatedAt: timestamp,
-    episodes: [...(currentNovel?.episodes ?? [])].map((episode) => ({
-      ...episode,
-      chapters: [...(episode.chapters ?? [])],
-    })),
     metadata: {
       ...DEFAULT_NOVEL.metadata,
       ...(currentNovel?.metadata ?? {}),
     },
   };
-
-  for (const chapter of chapters) {
-    let episode = novel.episodes.find(({ episodeNumber }) => episodeNumber === chapter.episodeNumber);
-    if (!episode) {
-      episode = {
-        episodeNumber: chapter.episodeNumber,
-        title: `Episode ${chapter.episodeNumber}`,
-        summary: '',
-        published: false,
-        chapters: [],
-      };
-      novel.episodes.push(episode);
-    }
-
-    const chapterIndex = episode.chapters.findIndex(
-      ({ chapterNumber }) => chapterNumber === chapter.chapterNumber,
-    );
-    const previousChapter = chapterIndex === -1 ? {} : episode.chapters[chapterIndex];
-    const updatedChapter = { ...previousChapter, ...chapter, lastEdited: timestamp };
-
-    if (chapterIndex === -1) episode.chapters.push(updatedChapter);
-    else episode.chapters[chapterIndex] = updatedChapter;
-  }
-
-  novel.episodes.sort((left, right) => left.episodeNumber - right.episodeNumber);
-  for (const episode of novel.episodes) {
-    episode.chapters.sort((left, right) => left.chapterNumber - right.chapterNumber);
-    episode.totalWords = episode.chapters.reduce((total, chapter) => total + (chapter.wordCount ?? 0), 0);
-  }
-  novel.metadata.totalWords = novel.episodes.reduce(
-    (total, episode) => total + episode.totalWords,
-    0,
-  );
-
-  return novel;
 }
 
 async function readChangedChapters(novelDir, changedFiles) {
@@ -161,7 +112,16 @@ async function readChangedChapters(novelDir, changedFiles) {
       continue;
     }
 
-    const content = await readFile(path.resolve(novelDir, filePath), 'utf8');
+    let content;
+    try {
+      content = await readFile(path.resolve(novelDir, filePath), 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        console.warn(`Skipping deleted story path: ${filePath}`);
+        continue;
+      }
+      throw error;
+    }
     chapters.push({
       ...location,
       title: extractTitle(content, `Chapter ${location.chapterNumber}`),
@@ -206,11 +166,66 @@ async function main() {
 
   const db = initializeFirestore();
   const novelRef = db.collection('novels').doc(NOVEL_ID);
-  const snapshot = await novelRef.get();
   const timestamp = new Date().toISOString();
-  const novel = buildUpdatedNovel(snapshot.exists ? snapshot.data() : {}, chapters, timestamp);
 
-  await novelRef.set(novel, { merge: true });
+  const novelSnapshot = await novelRef.get();
+  const currentNovel = novelSnapshot.exists ? novelSnapshot.data() : {};
+  const updatedNovel = buildUpdatedNovel(currentNovel, chapters, timestamp);
+  const episodes = Array.isArray(currentNovel.episodes)
+    ? currentNovel.episodes.map((episode) => ({
+      ...episode,
+      chapters: Array.isArray(episode.chapters) ? [...episode.chapters] : [],
+    }))
+    : [];
+
+  // Sync each changed chapter into the documented novels/{NOVEL_ID} schema.
+  for (const chapter of chapters) {
+    let episode = episodes.find(({ episodeNumber }) => episodeNumber === chapter.episodeNumber);
+    if (!episode) {
+      episode = {
+        episodeNumber: chapter.episodeNumber,
+        title: `Episode ${chapter.episodeNumber}`,
+        summary: '',
+        published: false,
+        chapters: [],
+      };
+      episodes.push(episode);
+    }
+
+    const existingIndex = episode.chapters.findIndex(
+      ({ chapterNumber }) => chapterNumber === chapter.chapterNumber,
+    );
+    const existingChapter = existingIndex === -1 ? {} : episode.chapters[existingIndex];
+    const updatedChapter = {
+      ...existingChapter,
+      chapterNumber: chapter.chapterNumber,
+      title: chapter.title,
+      content: chapter.content,
+      wordCount: chapter.wordCount,
+      lastEdited: timestamp,
+      notes: existingChapter.notes ?? '',
+      slug: chapter.slug,
+    };
+
+    if (existingIndex === -1) episode.chapters.push(updatedChapter);
+    else episode.chapters[existingIndex] = updatedChapter;
+  }
+
+  episodes.sort((left, right) => left.episodeNumber - right.episodeNumber);
+  let totalWordsNovel = 0;
+  for (const episode of episodes) {
+    episode.chapters.sort((left, right) => left.chapterNumber - right.chapterNumber);
+    episode.totalWords = episode.chapters.reduce(
+      (total, current) => total + (current.wordCount ?? 0),
+      0,
+    );
+    totalWordsNovel += episode.totalWords;
+  }
+
+  updatedNovel.episodes = episodes;
+  updatedNovel.metadata.totalWords = totalWordsNovel;
+  await novelRef.set(updatedNovel, { merge: true });
+
   console.log(`Synced ${chapters.length} chapter(s) to novels/${NOVEL_ID}.`);
 }
 
