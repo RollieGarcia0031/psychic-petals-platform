@@ -49,6 +49,8 @@
 }
 
 :root {
+  --font-geist-sans: ui-sans-serif, system-ui, sans-serif;
+  --font-geist-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -127,4 +129,74 @@
   html {
     @apply font-sans;
   }
+}
+
+.font-serif {
+  font-family: Georgia, Cambria, "Times New Roman", Times, serif;
+}
+
+.reader-prose p + p {
+  margin-top: 1.5em;
+}
+
+.reader-prose h1,
+.reader-prose h2,
+.reader-prose h3,
+.reader-prose h4,
+.reader-prose h5,
+.reader-prose h6 {
+  margin-top: 1.75em;
+  color: #282320;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.reader-prose h1 { font-size: 1.8em; }
+.reader-prose h2 { font-size: 1.5em; }
+.reader-prose h3 { font-size: 1.25em; }
+
+.reader-prose ul,
+.reader-prose ol {
+  margin: 1.5em 0;
+  padding-left: 1.5em;
+}
+
+.reader-prose ul { list-style-type: disc; }
+.reader-prose ol { list-style-type: decimal; }
+.reader-prose li + li { margin-top: 0.5em; }
+
+.reader-prose a {
+  color: #8b573a;
+  text-decoration: underline;
+  text-decoration-color: #d5b99d;
+  text-underline-offset: 0.15em;
+}
+
+.reader-prose blockquote {
+  margin: 1.5em 0;
+  border-left: 3px solid #d5b99d;
+  padding-left: 1.25em;
+  color: #756d66;
+  font-style: italic;
+}
+
+.reader-prose hr {
+  margin: 2.5em 0;
+  border-color: #e5ddd3;
+}
+
+.reader-prose code {
+  border-radius: 0.25rem;
+  background: #f1ebe3;
+  padding: 0.1em 0.3em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+}
+
+.reader-prose p:first-child::first-letter {
+  float: left;
+  margin: 0.12em 0.12em 0 0;
+  color: #a56c48;
+  font-size: 3.3em;
+  line-height: 0.72;
 }
