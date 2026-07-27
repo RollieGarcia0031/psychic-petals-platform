@@ -163,18 +163,13 @@ export function NovelReader() {
         <div className="min-w-0 flex-1">
           {isLoading ? <ReaderLoading /> : error ? <ReaderError message={error} /> : !chapter ? <ReaderEmpty /> : (
             <article className="mx-auto max-w-3xl">
-              <div className="mb-5 flex items-center justify-between text-xs font-medium text-[#837971]">
-                <span>{chapter.episode.title}</span>
-                <span>Chapter {chapter.chapterNumber}</span>
-              </div>
               <div className="overflow-hidden rounded-[1.75rem] border border-[#201d1b]/8 bg-[#fffdf9] shadow-[0_22px_70px_-30px_rgba(47,35,28,0.28)]">
                 <div className="border-b border-[#201d1b]/7 px-7 pb-7 pt-10 sm:px-14 sm:pb-10 sm:pt-16">
                   <div className="mb-5 flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.18em] text-[#a56c48]"><BookOpen className="size-3.5" /> {chapter.episode.title}</div>
                   <p className="font-serif text-sm italic text-[#8a8077]">Chapter {chapter.chapterNumber}</p>
-                  <h1 className="mt-2 max-w-2xl font-serif text-4xl leading-[1.06] tracking-[-0.035em] text-[#282320] sm:text-6xl">{chapter.title}</h1>
                   <div className="mt-7 flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-[#8a8077]"><span>{formatNumber(chapter.wordCount)} words</span><span className="hidden size-1 rounded-full bg-[#c5bbb2] sm:block" /><span className="flex items-center gap-1.5"><Clock3 className="size-3.5" />{formatDate(chapter.lastEdited)}</span></div>
                 </div>
-                <div className="px-7 py-9 sm:px-14 sm:py-14">
+                <div className="px-7 pb-9 sm:px-14 sm:py-14">
                   <div className="reader-prose font-serif text-[1.1rem] leading-8 text-[#39332e] sm:text-xl sm:leading-9">
                     <ReactMarkdown rehypePlugins={[rehypeRaw]}>{chapter.content}</ReactMarkdown>
                   </div>
