@@ -96,7 +96,7 @@ router.post('/add', async (req, res) => {
   }
 
   try {
-    const novelDoc = buildNovelDocument(req.body);
+    const novelDoc = buildNovelDocument({ body: req.body, timestamp: FieldValue.serverTimestamp() });
 
     // Firestore auto-generates the document ID which acts as `_id`
     const docRef = await db.collection('novels').add(novelDoc);

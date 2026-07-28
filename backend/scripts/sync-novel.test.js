@@ -4,8 +4,8 @@ import {
   parseChapterPath,
   extractTitle,
   countWords,
-  buildNovelDocument,
 } from './sync-novel.js';
+import { buildNovelDocument } from '../utils/novelUtils.js';
 
 // ---------------------------------------------------------------------------
 // parseArguments
@@ -218,81 +218,140 @@ describe('countWords', () => {
 describe('buildNovelDocument', () => {
   const testTimestamp = '2026-07-25T12:00:00.000Z';
 
-  it('builds a document with defaults when no current data exists', () => {
-    const doc = buildNovelDocument(undefined, testTimestamp);
+  describe('currentData path (sync script)', () => {
+    it('builds a document with defaults when no current data exists', () => {
+      const doc = buildNovelDocument({ currentData: undefined, timestamp: testTimestamp, includeId: true });
 
-    expect(doc).toEqual({
-      _id: 'psychic_petals',
-      title: 'Psychic Petals',
-      description:
-        'A magical realism and slice of life novel about quiet, personal moments in a world of psionic societies.',
-      author: 'RollieGarcia0031',
-      status: 'draft',
-      createdAt: testTimestamp,
-      updatedAt: testTimestamp,
-      metadata: {
-        tags: ['magical-realism', 'slice-of-life'],
-        coverImage: '',
-        totalWords: 0,
-      },
+      expect(doc).toEqual({
+        _id: 'psychic_petals',
+        title: 'Psychic Petals',
+        description:
+          'A magical realism and slice of life novel about quiet, personal moments in a world of psionic societies.',
+        author: 'RollieGarcia0031',
+        status: 'draft',
+        createdAt: testTimestamp,
+        updatedAt: testTimestamp,
+        metadata: {
+          tags: ['magical-realism', 'slice-of-life'],
+          coverImage: '',
+          totalWords: 0,
+        },
+      });
+    });
+
+    it('builds a document with defaults when current data is null', () => {
+      const doc = buildNovelDocument({ currentData: null, timestamp: testTimestamp, includeId: true });
+
+      expect(doc._id).toBe('psychic_petals');
+      expect(doc.status).toBe('draft');
+      expect(doc.metadata.tags).toEqual(['magical-realism', 'slice-of-life']);
+    });
+
+    it('preserves fields from current data', () => {
+      const current = {
+        description: 'Custom description.',
+        author: 'Custom Author',
+        status: 'published',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        metadata: {
+          tags: ['fantasy'],
+          coverImage: 'https://example.com/cover.jpg',
+        },
+      };
+
+      const doc = buildNovelDocument({ currentData: current, timestamp: testTimestamp, includeId: true });
+
+      expect(doc.description).toBe('Custom description.');
+      expect(doc.author).toBe('Custom Author');
+      expect(doc.status).toBe('published');
+      expect(doc.createdAt).toBe('2026-01-01T00:00:00.000Z');
+      expect(doc.metadata.tags).toEqual(['fantasy']);
+      expect(doc.metadata.coverImage).toBe('https://example.com/cover.jpg');
+    });
+
+    it('overrides updatedAt with the provided timestamp', () => {
+      const current = { updatedAt: '2026-01-01T00:00:00.000Z' };
+      const doc = buildNovelDocument({ currentData: current, timestamp: testTimestamp, includeId: true });
+
+      expect(doc.updatedAt).toBe(testTimestamp);
+    });
+
+    it('sets totalWords to 0 (recalculated at sync end)', () => {
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp, includeId: true });
+      expect(doc.metadata.totalWords).toBe(0);
+    });
+
+    it('omits _id when includeId is false', () => {
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp });
+      expect(doc._id).toBeUndefined();
+    });
+
+    it('fills in missing nested metadata fields with defaults', () => {
+      const current = { metadata: { tags: ['sci-fi'] } };
+      const doc = buildNovelDocument({ currentData: current, timestamp: testTimestamp, includeId: true });
+
+      expect(doc.metadata.tags).toEqual(['sci-fi']);
+      expect(doc.metadata.coverImage).toBe('');
     });
   });
 
-  it('builds a document with defaults when current data is null', () => {
-    const doc = buildNovelDocument(null, testTimestamp);
+  describe('body path (API routes)', () => {
+    it('builds a document from request body', () => {
+      const doc = buildNovelDocument({
+        body: { title: 'My Novel', author: 'Author', metadata: {} },
+        timestamp: testTimestamp,
+      });
 
-    expect(doc.status).toBe('draft');
-    expect(doc.metadata.tags).toEqual(['magical-realism', 'slice-of-life']);
-  });
+      expect(doc).toEqual({
+        title: 'My Novel',
+        description: '',
+        author: 'Author',
+        status: 'draft',
+        createdAt: testTimestamp,
+        updatedAt: testTimestamp,
+        metadata: {
+          tags: [],
+          coverImage: '',
+          totalWords: 0,
+        },
+      });
+    });
 
-  it('preserves fields from current data', () => {
-    const current = {
-      description: 'Custom description.',
-      author: 'Custom Author',
-      status: 'published',
-      createdAt: '2026-01-01T00:00:00.000Z',
-      metadata: {
-        tags: ['fantasy'],
-        coverImage: 'https://example.com/cover.jpg',
-      },
-    };
+    it('trims title and author', () => {
+      const doc = buildNovelDocument({
+        body: { title: '  Spaced Title  ', author: '  Spaced Author  ' },
+        timestamp: testTimestamp,
+      });
 
-    const doc = buildNovelDocument(current, testTimestamp);
+      expect(doc.title).toBe('Spaced Title');
+      expect(doc.author).toBe('Spaced Author');
+    });
 
-    expect(doc.description).toBe('Custom description.');
-    expect(doc.author).toBe('Custom Author');
-    expect(doc.status).toBe('published');
-    expect(doc.createdAt).toBe('2026-01-01T00:00:00.000Z');
-    expect(doc.metadata.tags).toEqual(['fantasy']);
-    expect(doc.metadata.coverImage).toBe('https://example.com/cover.jpg');
-  });
+    it('uses provided status and metadata', () => {
+      const doc = buildNovelDocument({
+        body: {
+          title: 'Novel',
+          author: 'Author',
+          status: 'published',
+          description: 'A great book.',
+          metadata: { tags: ['fantasy'], coverImage: 'img.jpg', totalWords: 5000 },
+        },
+        timestamp: testTimestamp,
+      });
 
-  it('overrides updatedAt with the provided timestamp', () => {
-    const current = { updatedAt: '2026-01-01T00:00:00.000Z' };
-    const doc = buildNovelDocument(current, testTimestamp);
+      expect(doc.status).toBe('published');
+      expect(doc.description).toBe('A great book.');
+      expect(doc.metadata.tags).toEqual(['fantasy']);
+      expect(doc.metadata.coverImage).toBe('img.jpg');
+      expect(doc.metadata.totalWords).toBe(5000);
+    });
 
-    expect(doc.updatedAt).toBe(testTimestamp);
-  });
-
-  it('sets totalWords to 0 (recalculated at sync end)', () => {
-    const doc = buildNovelDocument({}, testTimestamp);
-    expect(doc.metadata.totalWords).toBe(0);
-  });
-
-  it('always uses the constant NOVEL_ID and NOVEL_TITLE', () => {
-    const doc = buildNovelDocument(
-      { _id: 'something_else', title: 'Other Title' },
-      testTimestamp,
-    );
-    expect(doc._id).toBe('psychic_petals');
-    expect(doc.title).toBe('Psychic Petals');
-  });
-
-  it('fills in missing nested metadata fields with defaults', () => {
-    const current = { metadata: { tags: ['sci-fi'] } };
-    const doc = buildNovelDocument(current, testTimestamp);
-
-    expect(doc.metadata.tags).toEqual(['sci-fi']);
-    expect(doc.metadata.coverImage).toBe('');
+    it('does not include _id field', () => {
+      const doc = buildNovelDocument({
+        body: { title: 'Novel', author: 'Author' },
+        timestamp: testTimestamp,
+      });
+      expect(doc._id).toBeUndefined();
+    });
   });
 });

@@ -1,5 +1,8 @@
 import { FieldValue } from 'firebase-admin/firestore';
 
+const NOVEL_ID = 'psychic_petals';
+const NOVEL_TITLE = 'Psychic Petals';
+
 /**
  * Validates the required root-level fields of a novel payload.
  * Returns an array of error messages (empty when valid).
@@ -44,30 +47,54 @@ export function validateNovelPayload(body) {
 }
 
 /**
- * Builds a Firestore-ready novel document from the validated request body.
- * Optional fields fall back to sensible defaults so the stored document
- * always conforms to the schema defined in docs/DATABASE.md.
+ * Builds a Firestore-ready novel document.
  *
- * @param {object} body - The validated, parsed request body.
- * @returns {object} The novel document ready to be written to Firestore.
+ * Two call patterns are supported:
+ *   - Sync script: pass `currentData` (existing Firestore doc) and `timestamp` (ISO string).
+ *   - API routes:  pass `body` (request body) and `timestamp` (FieldValue.serverTimestamp()).
+ *
+ * @param {object} opts
+ * @param {object} [opts.currentData] - Existing Firestore doc (sync script).
+ * @param {object} [opts.body] - Request body (API routes).
+ * @param {string|FieldValue} opts.timestamp - ISO string or FieldValue.serverTimestamp().
+ * @param {boolean} [opts.includeId=false] - Include _id field (sync script only).
  */
-export function buildNovelDocument(body) {
-  const now = FieldValue.serverTimestamp();
-
-  const metadata = {
-    tags: body.metadata?.tags ?? [],
-    coverImage: body.metadata?.coverImage ?? '',
-    totalWords: body.metadata?.totalWords ?? 0,
-  };
+export function buildNovelDocument({ currentData, body, timestamp, includeId = false }) {
+  if (!body) {
+    // Sync script path: merge existing data with defaults
+    const doc = {
+      title: NOVEL_TITLE,
+      description:
+        currentData?.description ??
+        'A magical realism and slice of life novel about quiet, personal moments in a world of psionic societies.',
+      author: currentData?.author ?? 'RollieGarcia0031',
+      status: currentData?.status ?? 'draft',
+      createdAt: currentData?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      metadata: {
+        tags: currentData?.metadata?.tags ?? ['magical-realism', 'slice-of-life'],
+        coverImage: currentData?.metadata?.coverImage ?? '',
+        totalWords: 0,
+      },
+    };
+    if (includeId) {
+      doc._id = NOVEL_ID;
+    }
+    return doc;
+  }
 
   return {
     title: body.title.trim(),
     description: body.description ?? '',
     author: body.author.trim(),
     status: body.status ?? 'draft',
-    createdAt: now,
-    updatedAt: now,
-    metadata,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    metadata: {
+      tags: body.metadata?.tags ?? [],
+      coverImage: body.metadata?.coverImage ?? '',
+      totalWords: body.metadata?.totalWords ?? 0,
+    },
   };
 }
 
