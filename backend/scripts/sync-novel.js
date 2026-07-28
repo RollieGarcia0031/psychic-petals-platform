@@ -5,9 +5,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
+import { buildNovelDocument } from '../utils/novelUtils.js';
 
 const NOVEL_ID = 'psychic_petals';
-const NOVEL_TITLE = 'Psychic Petals';
 
 /** Parse the command-line arguments accepted by this script. */
 export function parseArguments(argv) {
@@ -77,31 +77,6 @@ export function extractTitle(content, fallbackTitle) {
 export function countWords(content) {
   const trimmed = content.trim();
   return trimmed ? trimmed.split(/\s+/).length : 0;
-}
-
-/**
- * Build a metadata-only novel document for the root Firestore document.
- *
- * Per docs/DATABASE.md, the root novel document contains only metadata —
- * episodes and chapters live in subcollections.
- */
-export function buildNovelDocument(currentData, timestamp) {
-  return {
-    _id: NOVEL_ID,
-    title: NOVEL_TITLE,
-    description:
-      currentData?.description ??
-      'A magical realism and slice of life novel about quiet, personal moments in a world of psionic societies.',
-    author: currentData?.author ?? 'RollieGarcia0031',
-    status: currentData?.status ?? 'draft',
-    createdAt: currentData?.createdAt ?? timestamp,
-    updatedAt: timestamp,
-    metadata: {
-      tags: currentData?.metadata?.tags ?? ['magical-realism', 'slice-of-life'],
-      coverImage: currentData?.metadata?.coverImage ?? '',
-      totalWords: 0, // recalculated at the end of the sync
-    },
-  };
 }
 
 async function readChangedChapters(novelDir, changedFiles) {
@@ -269,7 +244,7 @@ async function main() {
     totalWordsNovel += doc.data().totalWords ?? 0;
   });
 
-  const novelDoc = buildNovelDocument(currentNovel, timestamp);
+  const novelDoc = buildNovelDocument({ currentData: currentNovel, timestamp, includeId: true });
   novelDoc.metadata.totalWords = totalWordsNovel;
   await novelRef.set(novelDoc, { merge: true });
 
