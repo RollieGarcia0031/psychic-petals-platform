@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
@@ -34,6 +34,10 @@ export function parseArguments(argv) {
   return {
     novelDir: options['novel-dir'],
     changedFiles: (options.changed ?? '')
+      .split(',')
+      .map((file) => file.trim())
+      .filter(Boolean),
+    deletedFiles: (options.deleted ?? '')
       .split(',')
       .map((file) => file.trim())
       .filter(Boolean),
@@ -74,6 +78,30 @@ export function extractTitle(content, fallbackTitle) {
   return title || fallbackTitle;
 }
 
+/** Recursively find all Markdown files in a directory. */
+async function getAllMarkdownFiles(dir) {
+  const files = [];
+  async function scan(currentDir) {
+    let entries;
+    try {
+      entries = await readdir(currentDir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await scan(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+        files.push(fullPath);
+      }
+    }
+  }
+  await scan(dir);
+  return files;
+}
+
 export function countWords(content) {
   const trimmed = content.trim();
   return trimmed ? trimmed.split(/\s+/).length : 0;
@@ -81,6 +109,7 @@ export function countWords(content) {
 
 async function readChangedChapters(novelDir, changedFiles) {
   const chapters = [];
+  const extraDeletedFiles = [];
   for (const filePath of changedFiles) {
     const location = parseChapterPath(filePath);
     if (!location) {
@@ -93,11 +122,19 @@ async function readChangedChapters(novelDir, changedFiles) {
       content = await readFile(path.resolve(novelDir, filePath), 'utf8');
     } catch (error) {
       if (error?.code === 'ENOENT') {
-        console.warn(`Skipping deleted story path: ${filePath}`);
+        console.warn(`Detected deleted story path: ${filePath}`);
+        extraDeletedFiles.push(filePath);
         continue;
       }
       throw error;
     }
+
+    if (!content || content.trim() === '') {
+      console.warn(`Detected empty chapter content, marking for deletion: ${filePath}`);
+      extraDeletedFiles.push(filePath);
+      continue;
+    }
+
     chapters.push({
       ...location,
       title: extractTitle(content, `Chapter ${location.chapterNumber}`),
@@ -105,7 +142,29 @@ async function readChangedChapters(novelDir, changedFiles) {
       wordCount: countWords(content),
     });
   }
-  return chapters;
+  return { chapters, extraDeletedFiles };
+}
+
+/** Delete removed chapters from Firestore. */
+export async function deleteChapters(novelRef, deletedFiles) {
+  const deletedChapters = [];
+  for (const filePath of deletedFiles) {
+    const location = parseChapterPath(filePath);
+    if (!location) {
+      console.warn(`Skipping unsupported deleted story path: ${filePath}`);
+      continue;
+    }
+
+    const chapterRef = novelRef
+      .collection('episodes')
+      .doc(location.episodeNumber.toString())
+      .collection('chapters')
+      .doc(location.chapterNumber.toString());
+
+    await chapterRef.delete();
+    deletedChapters.push(location);
+  }
+  return deletedChapters;
 }
 
 function initializeFirestore() {
@@ -147,15 +206,17 @@ async function calculateEpisodeTotalWords(chaptersRef) {
 }
 
 async function main() {
-  const { novelDir, changedFiles } = parseArguments(process.argv.slice(2));
-  if (changedFiles.length === 0) {
-    console.log('No changed Markdown files supplied; nothing to sync.');
+  const { novelDir, changedFiles, deletedFiles } = parseArguments(process.argv.slice(2));
+  if (changedFiles.length === 0 && deletedFiles.length === 0) {
+    console.log('No changed or deleted Markdown files supplied; nothing to sync.');
     return;
   }
 
-  const chapters = await readChangedChapters(novelDir, changedFiles);
-  if (chapters.length === 0) {
-    console.log('No supported chapter files found; nothing to sync.');
+  const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, changedFiles);
+  const allDeletedFiles = [...deletedFiles, ...extraDeletedFiles];
+
+  if (chapters.length === 0 && allDeletedFiles.length === 0) {
+    console.log('No supported chapter files to sync or delete.');
     return;
   }
 
@@ -165,6 +226,45 @@ async function main() {
 
   // Track which episode numbers were touched so we can recalc their totals
   const touchedEpisodeNumbers = new Set();
+
+  // Delete removed chapters first
+  const deletedChapters = await deleteChapters(novelRef, allDeletedFiles);
+  for (const del of deletedChapters) {
+    touchedEpisodeNumbers.add(del.episodeNumber);
+  }
+
+  // Reconciliation: find and delete any other chapters in DB that do not exist on disk
+  const mainDir = path.resolve(novelDir, 'main');
+  const allFiles = await getAllMarkdownFiles(mainDir);
+  const existingChapters = new Set();
+  for (const file of allFiles) {
+    const relativePath = path.relative(novelDir, file);
+    const loc = parseChapterPath(relativePath);
+    if (loc) {
+      existingChapters.add(`${loc.episodeNumber}-${loc.chapterNumber}`);
+    }
+  }
+
+  const reconcileEpisodesSnapshot = await novelRef.collection('episodes').get();
+  for (const epDoc of reconcileEpisodesSnapshot.docs) {
+    const epNumStr = epDoc.id;
+    const epNum = Number.parseInt(epNumStr, 10);
+    if (Number.isNaN(epNum)) continue;
+
+    const chaptersSnapshot = await epDoc.ref.collection('chapters').get();
+    for (const chDoc of chaptersSnapshot.docs) {
+      const chNumStr = chDoc.id;
+      const chNum = Number.parseInt(chNumStr, 10);
+      if (Number.isNaN(chNum)) continue;
+
+      const key = `${epNum}-${chNum}`;
+      if (!existingChapters.has(key)) {
+        console.warn(`Reconciliation: Deleting orphaned chapter doc from Firestore: episode ${epNum}, chapter ${chNum}`);
+        await chDoc.ref.delete();
+        touchedEpisodeNumbers.add(epNum);
+      }
+    }
+  }
 
   // Group chapters by episode for batch-friendly processing
   const chaptersByEpisode = {};
@@ -249,7 +349,9 @@ async function main() {
   await novelRef.set(novelDoc, { merge: true });
 
   const epLog = [...touchedEpisodeNumbers].sort((a, b) => a - b).join(', ');
-  console.log(`Synced ${chapters.length} chapter(s) to novels/${NOVEL_ID} (episodes: ${epLog}).`);
+  console.log(
+    `Synced ${chapters.length} chapter(s) and deleted ${deletedChapters.length} chapter(s) to novels/${NOVEL_ID} (episodes: ${epLog}).`,
+  );
 }
 
 if (

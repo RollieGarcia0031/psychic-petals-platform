@@ -4,6 +4,7 @@ import {
   parseChapterPath,
   extractTitle,
   countWords,
+  deleteChapters,
 } from './sync-novel.js';
 import { buildNovelDocument } from '../utils/novelUtils.js';
 
@@ -25,6 +26,7 @@ describe('parseArguments', () => {
         'main/episode-01/01-the-classroom-intro.md',
         'main/episode-01/02-new-friend.md',
       ],
+      deletedFiles: [],
     });
   });
 
@@ -83,6 +85,92 @@ describe('parseArguments', () => {
     ]);
     expect(result.novelDir).toBe('/tmp/n');
     expect(result.changedFiles).toEqual(['f1.md']);
+  });
+
+  it('parses --deleted correctly', () => {
+    const result = parseArguments([
+      '--novel-dir',
+      '/tmp/test',
+      '--changed',
+      'main/episode-01/01-hello.md',
+      '--deleted',
+      'main/episode-01/02-deleted.md,main/episode-02/01-deleted.md',
+    ]);
+
+    expect(result).toEqual({
+      novelDir: '/tmp/test',
+      changedFiles: ['main/episode-01/01-hello.md'],
+      deletedFiles: [
+        'main/episode-01/02-deleted.md',
+        'main/episode-02/01-deleted.md',
+      ],
+    });
+  });
+
+  it('handles empty --deleted gracefully', () => {
+    const result = parseArguments([
+      '--novel-dir',
+      '/tmp/test',
+      '--deleted',
+      '',
+    ]);
+
+    expect(result.deletedFiles).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deleteChapters
+// ---------------------------------------------------------------------------
+describe('deleteChapters', () => {
+  it('deletes supported paths and returns deleted locations', async () => {
+    const deletedPaths = [];
+    const mockDoc = (epId, chId) => ({
+      delete: async () => {
+        deletedPaths.push({ epId, chId });
+      },
+    });
+
+    const mockCollectionChapters = (epId) => ({
+      doc: (chId) => mockDoc(epId, chId),
+    });
+
+    const mockEpisodeDoc = (epId) => ({
+      collection: (name) => {
+        if (name === 'chapters') return mockCollectionChapters(epId);
+        throw new Error(`Unexpected collection: ${name}`);
+      },
+    });
+
+    const mockEpisodesCollection = {
+      doc: (epId) => {
+        return mockEpisodeDoc(epId);
+      },
+    };
+
+    const mockNovelRef = {
+      collection: (name) => {
+        if (name === 'episodes') return mockEpisodesCollection;
+        throw new Error(`Unexpected collection: ${name}`);
+      },
+    };
+
+    const files = [
+      'main/episode-01/02-deleted.md',
+      'unsupported-path.md',
+      'main/episode-02/01-another.md',
+    ];
+
+    const result = await deleteChapters(mockNovelRef, files);
+
+    expect(result).toEqual([
+      { episodeNumber: 1, chapterNumber: 2, slug: 'deleted' },
+      { episodeNumber: 2, chapterNumber: 1, slug: 'another' },
+    ]);
+    expect(deletedPaths).toEqual([
+      { epId: '1', chId: '2' },
+      { epId: '2', chId: '1' },
+    ]);
   });
 });
 
