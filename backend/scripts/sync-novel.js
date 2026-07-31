@@ -53,7 +53,7 @@ export function parseArguments(argv) {
 export function parseChapterPath(filePath) {
   // Normalise separators so the regex works on any platform.
   const normalizedPath = filePath.split(path.sep).join('/').replace(/\\/g, '/');
-  const directMatch = normalizedPath.match(/^main\/episode-(\d+)\/(\d+)-(.+)\.md$/i);
+  const directMatch = normalizedPath.match(/^main\/episode-(\d+)\/(\d+)-(.+)\.md$/);
   if (directMatch) {
     return {
       episodeNumber: Number.parseInt(directMatch[1], 10),
