@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readdir, readFile, realpath } from 'node:fs/promises';
+import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
@@ -8,6 +8,9 @@ import { getFirestore } from 'firebase-admin/firestore';
 import { buildNovelDocument } from '../utils/novelUtils.js';
 
 const NOVEL_ID = 'psychic_petals';
+
+/** Maximum size in bytes of a single chapter file before it is rejected. */
+export const MAX_FILE_SIZE = 512 * 1024;
 
 /** Parse the command-line arguments accepted by this script. */
 export function parseArguments(argv) {
@@ -158,6 +161,14 @@ export async function readChangedChapters(novelDir, changedFiles) {
 
     if (!isInsideDir(canonicalNovelDir, canonicalFilePath)) {
       console.warn(`Skipping path that escapes novel directory via symlink: ${filePath}`);
+      continue;
+    }
+
+    const fileStat = await stat(canonicalFilePath);
+    if (fileStat.size > MAX_FILE_SIZE) {
+      console.warn(
+        `Skipping oversized story file (${fileStat.size} bytes > ${MAX_FILE_SIZE}): ${filePath}`,
+      );
       continue;
     }
 
