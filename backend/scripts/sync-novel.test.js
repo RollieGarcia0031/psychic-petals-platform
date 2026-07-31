@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   parseArguments,
   parseChapterPath,
@@ -275,6 +278,96 @@ describe('readChangedChapters', () => {
     expect(chapters).toHaveLength(0);
     expect(extraDeletedFiles).toHaveLength(0);
     warnSpy.mockRestore();
+  });
+
+  it('skips a chapter file that is a symlink escaping the novel directory', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    const outsideDir = path.join(tempRoot, 'outside');
+    await mkdir(path.join(novelDir, 'main', 'episode-01'), { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    await writeFile(path.join(outsideDir, 'secret.md'), 'outside content');
+    await symlink(
+      path.join(outsideDir, 'secret.md'),
+      path.join(novelDir, 'main', 'episode-01', '01-secret.md'),
+    );
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, [
+        'main/episode-01/01-secret.md',
+      ]);
+
+      expect(chapters).toHaveLength(0);
+      expect(extraDeletedFiles).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('via symlink'),
+      );
+    } finally {
+      warnSpy.mockRestore();
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a chapter whose parent directory symlinks outside the novel directory', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    const outsideDir = path.join(tempRoot, 'outside');
+    await mkdir(path.join(novelDir, 'main'), { recursive: true });
+    await mkdir(path.join(outsideDir, 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(outsideDir, 'episode-01', '01-secret.md'),
+      'outside content',
+    );
+    await symlink(
+      path.join(outsideDir, 'episode-01'),
+      path.join(novelDir, 'main', 'episode-01'),
+    );
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, [
+        'main/episode-01/01-secret.md',
+      ]);
+
+      expect(chapters).toHaveLength(0);
+      expect(extraDeletedFiles).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('via symlink'),
+      );
+    } finally {
+      warnSpy.mockRestore();
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a chapter symlinked within the novel directory', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'episode-01'), { recursive: true });
+    await writeFile(path.join(novelDir, 'main', 'episode-01', '01-real.md'), '# Real Chapter\n\nBody.');
+    await symlink(
+      path.join(novelDir, 'main', 'episode-01', '01-real.md'),
+      path.join(novelDir, 'main', 'episode-01', '02-link.md'),
+    );
+
+    try {
+      const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, [
+        'main/episode-01/02-link.md',
+      ]);
+
+      expect(extraDeletedFiles).toHaveLength(0);
+      expect(chapters).toHaveLength(1);
+      expect(chapters[0]).toMatchObject({
+        episodeNumber: 1,
+        chapterNumber: 2,
+        slug: 'link',
+        title: 'Real Chapter',
+        wordCount: 4,
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 });
 

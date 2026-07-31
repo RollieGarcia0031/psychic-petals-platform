@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
@@ -119,6 +119,18 @@ export function isInsideDir(baseDir, resolvedPath) {
 export async function readChangedChapters(novelDir, changedFiles) {
   const chapters = [];
   const extraDeletedFiles = [];
+
+  let canonicalNovelDir;
+  try {
+    canonicalNovelDir = await realpath(novelDir);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      console.warn(`Skipping sync, novel directory not found: ${novelDir}`);
+      return { chapters, extraDeletedFiles };
+    }
+    throw error;
+  }
+
   for (const filePath of changedFiles) {
     const location = parseChapterPath(filePath);
     if (!location) {
@@ -126,15 +138,32 @@ export async function readChangedChapters(novelDir, changedFiles) {
       continue;
     }
 
-    const resolvedFilePath = path.resolve(novelDir, filePath);
-    if (!isInsideDir(novelDir, resolvedFilePath)) {
+    const resolvedFilePath = path.resolve(canonicalNovelDir, filePath);
+    if (!isInsideDir(canonicalNovelDir, resolvedFilePath)) {
       console.warn(`Skipping path that escapes novel directory: ${filePath}`);
+      continue;
+    }
+
+    let canonicalFilePath;
+    try {
+      canonicalFilePath = await realpath(resolvedFilePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        console.warn(`Detected deleted story path: ${filePath}`);
+        extraDeletedFiles.push(filePath);
+        continue;
+      }
+      throw error;
+    }
+
+    if (!isInsideDir(canonicalNovelDir, canonicalFilePath)) {
+      console.warn(`Skipping path that escapes novel directory via symlink: ${filePath}`);
       continue;
     }
 
     let content;
     try {
-      content = await readFile(resolvedFilePath, 'utf8');
+      content = await readFile(canonicalFilePath, 'utf8');
     } catch (error) {
       if (error?.code === 'ENOENT') {
         console.warn(`Detected deleted story path: ${filePath}`);
