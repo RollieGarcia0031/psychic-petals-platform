@@ -107,7 +107,16 @@ export function countWords(content) {
   return trimmed ? trimmed.split(/\s+/).length : 0;
 }
 
-async function readChangedChapters(novelDir, changedFiles) {
+/**
+ * Return true when resolvedPath is strictly inside baseDir.
+ * Used as a defence-in-depth check against path traversal in readChangedChapters.
+ */
+export function isInsideDir(baseDir, resolvedPath) {
+  const base = path.resolve(baseDir);
+  return resolvedPath.startsWith(base + path.sep);
+}
+
+export async function readChangedChapters(novelDir, changedFiles) {
   const chapters = [];
   const extraDeletedFiles = [];
   for (const filePath of changedFiles) {
@@ -117,9 +126,15 @@ async function readChangedChapters(novelDir, changedFiles) {
       continue;
     }
 
+    const resolvedFilePath = path.resolve(novelDir, filePath);
+    if (!isInsideDir(novelDir, resolvedFilePath)) {
+      console.warn(`Skipping path that escapes novel directory: ${filePath}`);
+      continue;
+    }
+
     let content;
     try {
-      content = await readFile(path.resolve(novelDir, filePath), 'utf8');
+      content = await readFile(resolvedFilePath, 'utf8');
     } catch (error) {
       if (error?.code === 'ENOENT') {
         console.warn(`Detected deleted story path: ${filePath}`);
