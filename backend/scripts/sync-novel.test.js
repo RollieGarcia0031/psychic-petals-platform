@@ -10,6 +10,7 @@ import {
   deleteChapters,
   readChangedChapters,
   isInsideDir,
+  chunk,
 } from './sync-novel.js';
 import { buildNovelDocument } from '../utils/novelUtils.js';
 
@@ -477,6 +478,85 @@ describe('countWords', () => {
   it('counts words in markdown content', () => {
     const md = '# Chapter Title\n\nThis is the body of the chapter with several words.';
     expect(countWords(md)).toBe(13);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// chunk — Firestore batch chunking (Fix 4)
+// ---------------------------------------------------------------------------
+describe('chunk', () => {
+  it('returns a single chunk when the array fits within the size', () => {
+    expect(chunk([1, 2, 3], 500)).toEqual([[1, 2, 3]]);
+  });
+
+  it('splits an array larger than the size into multiple chunks', () => {
+    const input = Array.from({ length: 1200 }, (_, i) => i);
+    const result = chunk(input, 500);
+
+    expect(result).toHaveLength(3);
+    expect(result[0]).toHaveLength(500);
+    expect(result[1]).toHaveLength(500);
+    expect(result[2]).toHaveLength(200);
+    expect(result.flat()).toEqual(input);
+  });
+
+  it('splits exactly at the boundary into two equal chunks', () => {
+    const result = chunk([1, 2, 3, 4, 5, 6], 3);
+    expect(result).toEqual([
+      [1, 2, 3],
+      [4, 5, 6],
+    ]);
+  });
+
+  it('returns an empty array for an empty input', () => {
+    expect(chunk([], 500)).toEqual([]);
+  });
+
+  it('never produces a chunk exceeding the batch limit', () => {
+    const input = Array.from({ length: 1501 }, (_, i) => i);
+    for (const part of chunk(input, 500)) {
+      expect(part.length).toBeLessThanOrEqual(500);
+    }
+  });
+
+  it('rejects a zero size', () => {
+    expect(() => chunk([1, 2, 3], 0)).toThrow(
+      'chunk size must be a positive integer',
+    );
+  });
+
+  it('rejects a negative size', () => {
+    expect(() => chunk([1, 2, 3], -5)).toThrow(
+      'chunk size must be a positive integer',
+    );
+  });
+
+  it('rejects a fractional size', () => {
+    expect(() => chunk([1, 2, 3], 2.5)).toThrow(
+      'chunk size must be a positive integer',
+    );
+  });
+
+  it('rejects non-finite sizes', () => {
+    expect(() => chunk([1, 2, 3], NaN)).toThrow(
+      'chunk size must be a positive integer',
+    );
+    expect(() => chunk([1, 2, 3], Infinity)).toThrow(
+      'chunk size must be a positive integer',
+    );
+  });
+
+  it('rejects non-number sizes', () => {
+    expect(() => chunk([1, 2, 3], '500')).toThrow(
+      'chunk size must be a positive integer',
+    );
+  });
+
+  it('preserves valid chunking behavior', () => {
+    expect(chunk([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
+    expect(chunk([], 1)).toEqual([]);
+    expect(chunk([1], 1)).toEqual([[1]]);
+    expect(chunk([1, 2], 500)).toEqual([[1, 2]]);
   });
 });
 
