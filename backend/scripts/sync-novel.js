@@ -12,6 +12,21 @@ const NOVEL_ID = 'psychic_petals';
 /** Maximum size in bytes of a single chapter file before it is rejected. */
 export const MAX_FILE_SIZE = 512 * 1024;
 
+/** Maximum operations allowed in a single Firestore batch (Firestore caps at 500). */
+export const MAX_BATCH_OPERATIONS = 500;
+
+/** Split an array into chunks of at most `size` items each. */
+export function chunk(array, size) {
+  if (!Number.isInteger(size) || size <= 0) {
+    throw new RangeError(`chunk size must be a positive integer, got: ${size}`);
+  }
+  const chunks = [];
+  for (let index = 0; index < array.length; index += size) {
+    chunks.push(array.slice(index, index + size));
+  }
+  return chunks;
+}
+
 /** Parse the command-line arguments accepted by this script. */
 export function parseArguments(argv) {
   const options = {};
@@ -349,29 +364,32 @@ async function main() {
       });
     }
 
-    // Batch-upsert all chapters for this episode.
-    // Read each existing chapter first so we don't clobber fields set
-    // via the API routes (especially `notes`).
-    const batch = db.batch();
-    for (const chapter of episodeChapters) {
-      const chapterRef = episodeRef
-        .collection('chapters')
-        .doc(chapter.chapterNumber.toString());
+    // Batch-upsert all chapters for this episode. Read each existing
+    // chapter first so we don't clobber fields set via the API routes
+    // (especially `notes`). Chunk the chapter list so every Firestore
+    // batch stays within the 500-operation limit.
+    for (const episodeChunk of chunk(episodeChapters, MAX_BATCH_OPERATIONS)) {
+      const batch = db.batch();
+      for (const chapter of episodeChunk) {
+        const chapterRef = episodeRef
+          .collection('chapters')
+          .doc(chapter.chapterNumber.toString());
 
-      const existingSnap = await chapterRef.get();
-      const existing = existingSnap.exists ? existingSnap.data() : {};
+        const existingSnap = await chapterRef.get();
+        const existing = existingSnap.exists ? existingSnap.data() : {};
 
-      batch.set(chapterRef, {
-        chapterNumber: chapter.chapterNumber,
-        title: chapter.title,
-        slug: chapter.slug,
-        content: chapter.content,
-        wordCount: chapter.wordCount,
-        lastEdited: timestamp,
-        notes: existing.notes ?? '',
-      });
+        batch.set(chapterRef, {
+          chapterNumber: chapter.chapterNumber,
+          title: chapter.title,
+          slug: chapter.slug,
+          content: chapter.content,
+          wordCount: chapter.wordCount,
+          lastEdited: timestamp,
+          notes: existing.notes ?? '',
+        });
+      }
+      await batch.commit();
     }
-    await batch.commit();
   }
 
   // ── Step 2: Recalculate word counts for each touched episode ──────────
