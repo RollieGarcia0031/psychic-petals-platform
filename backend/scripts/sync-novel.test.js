@@ -11,6 +11,7 @@ import {
   readChangedChapters,
   isInsideDir,
   chunk,
+  MAX_FILE_SIZE,
 } from './sync-novel.js';
 import { buildNovelDocument } from '../utils/novelUtils.js';
 
@@ -367,6 +368,61 @@ describe('readChangedChapters', () => {
         wordCount: 4,
       });
     } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a chapter file that exceeds the size limit', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'episode-01', '01-huge.md'),
+      'a'.repeat(MAX_FILE_SIZE + 1),
+    );
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, [
+        'main/episode-01/01-huge.md',
+      ]);
+
+      expect(chapters).toHaveLength(0);
+      expect(extraDeletedFiles).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('oversized'));
+    } finally {
+      warnSpy.mockRestore();
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a chapter file exactly at the size limit', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'episode-01', '01-at-limit.md'),
+      'a'.repeat(MAX_FILE_SIZE),
+    );
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, [
+        'main/episode-01/01-at-limit.md',
+      ]);
+
+      expect(chapters).toHaveLength(1);
+      expect(chapters[0]).toMatchObject({
+        episodeNumber: 1,
+        chapterNumber: 1,
+        slug: 'at-limit',
+      });
+      expect(extraDeletedFiles).toHaveLength(0);
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('oversized'),
+      );
+    } finally {
+      warnSpy.mockRestore();
       await rm(tempRoot, { recursive: true, force: true });
     }
   });
