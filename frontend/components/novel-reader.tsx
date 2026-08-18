@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import {
@@ -64,6 +64,11 @@ export function NovelReader() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isContentsOpen, setIsContentsOpen] = useState(false);
+  const articleRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    articleRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [activeIndex]);
 
   useEffect(() => {
     async function loadNovel() {
@@ -121,7 +126,6 @@ export function NovelReader() {
   function openChapter(index: number) {
     setActiveIndex(index);
     setIsContentsOpen(false);
-    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   return (
@@ -162,7 +166,7 @@ export function NovelReader() {
 
         <div className="min-w-0 flex-1">
           {isLoading ? <ReaderLoading /> : error ? <ReaderError message={error} /> : !chapter ? <ReaderEmpty /> : (
-            <article className="mx-auto max-w-3xl">
+            <article ref={articleRef} className="mx-auto max-w-3xl scroll-mt-16">
               <div className="overflow-hidden rounded-[1.75rem] border border-[#201d1b]/8 bg-[#fffdf9] shadow-[0_22px_70px_-30px_rgba(47,35,28,0.28)]">
                 <div className="border-b border-[#201d1b]/7 px-7 pb-7 pt-10 sm:px-14 sm:pb-10 sm:pt-16">
                   <div className="mb-5 flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.18em] text-[#a56c48]"><BookOpen className="size-3.5" /> {chapter.episode.title}</div>
