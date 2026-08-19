@@ -2,6 +2,7 @@ import express from 'express';
 import { db } from '../config/firebase.js';
 import { FieldValue } from 'firebase-admin/firestore';
 import { validateNovelPayload, buildNovelDocument, validateEpisodePayload, buildEpisodeObject, validateChapterPayload, buildChapterObject } from '../utils/novelUtils.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -84,7 +85,7 @@ router.get('/', async (req, res) => {
  *   "notes":         string
  * }
  */
-router.post('/add', async (req, res) => {
+router.post('/add', requireAuth, async (req, res) => {
   // --- Validation ---
   const errors = validateNovelPayload(req.body);
   if (errors.length > 0) {
@@ -151,7 +152,7 @@ router.post('/add', async (req, res) => {
  * @route   POST /api/novel/:id/episodes
  * @desc    Add a new episode to a novel's `episodes` array.
  */
-router.post('/:id/episodes', async (req, res) => {
+router.post('/:id/episodes', requireAuth, async (req, res) => {
   const novelId = req.params.id;
 
   const errors = validateEpisodePayload(req.body);
@@ -346,7 +347,7 @@ router.get('/:id/episodes/:episodeNumber/chapters', async (req, res) => {
  * @route   POST /api/novel/:id/episodes/:episodeNumber/chapters
  * @desc    Add a new chapter to a specific episode in a novel.
  */
-router.post('/:id/episodes/:episodeNumber/chapters', async (req, res) => {
+router.post('/:id/episodes/:episodeNumber/chapters', requireAuth, async (req, res) => {
   const novelId = req.params.id;
   const episodeNumber = parseInt(req.params.episodeNumber, 10);
 
@@ -426,7 +427,7 @@ router.post('/:id/episodes/:episodeNumber/chapters', async (req, res) => {
  * @route   PUT /api/novel/:id/episodes/:episodeNumber/chapters/:chapterNumber
  * @desc    Update an existing chapter in a specific episode.
  */
-router.put('/:id/episodes/:episodeNumber/chapters/:chapterNumber', async (req, res) => {
+router.put('/:id/episodes/:episodeNumber/chapters/:chapterNumber', requireAuth, async (req, res) => {
   const novelId = req.params.id;
   const episodeNumber = parseInt(req.params.episodeNumber, 10);
   const chapterNumber = parseInt(req.params.chapterNumber, 10);
