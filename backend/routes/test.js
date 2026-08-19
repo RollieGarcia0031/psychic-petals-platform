@@ -1,9 +1,10 @@
 import express from 'express';
 import { db } from '../config/firebase.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
-router.post('/test-db', async (req, res) => {
+router.post('/test-db', requireAuth, async (req, res) => {
   try {
     const data = req.body;
 
