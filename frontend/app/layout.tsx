@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AuthSessionSync } from "@/components/auth-session-sync";
+import { Footer } from "@/components/footer";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -19,7 +20,8 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         <AuthSessionSync />
-        {children}
+        <div className="flex-1">{children}</div>
+        <Footer />
       </body>
     </html>
   );
