@@ -13,7 +13,7 @@ import {
   chunk,
   MAX_FILE_SIZE,
 } from './sync-novel.js';
-import { buildNovelDocument } from '../utils/novelUtils.js';
+import { DEFAULT_NOVEL_ID, buildNovelDocument } from '../utils/novelUtils.js';
 
 // ---------------------------------------------------------------------------
 // parseArguments
@@ -696,6 +696,61 @@ describe('buildNovelDocument', () => {
 
       expect(doc.metadata.tags).toEqual(['sci-fi']);
       expect(doc.metadata.coverImage).toBe('');
+    });
+
+    it('uses a custom novelId for the _id field when provided', () => {
+      const doc = buildNovelDocument({
+        currentData: {},
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+      });
+
+      expect(doc._id).toBe('psychic_petals_tl');
+    });
+
+    it('defaults the _id field to DEFAULT_NOVEL_ID', () => {
+      expect(DEFAULT_NOVEL_ID).toBe('psychic_petals');
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp, includeId: true });
+      expect(doc._id).toBe('psychic_petals');
+    });
+
+    it('includes the language field when explicitly provided', () => {
+      const doc = buildNovelDocument({
+        currentData: {},
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+        language: 'tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('preserves an existing language from current data when not overridden', () => {
+      const doc = buildNovelDocument({
+        currentData: { language: 'tl' },
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('lets an explicit language override the stored one', () => {
+      const doc = buildNovelDocument({
+        currentData: { language: 'en' },
+        timestamp: testTimestamp,
+        language: 'tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('omits the language field when neither param nor current data provides it', () => {
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp, includeId: true });
+      expect('language' in doc).toBe(false);
     });
   });
 
