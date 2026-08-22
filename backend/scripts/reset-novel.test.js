@@ -176,6 +176,7 @@ afterEach(() => {
 
 const EN_CH1 = '# Unlabeled Maps\n\none two three four five';
 const EN_CH2 = '# Home\n\nsix seven eight';
+const TL_BODY_1 = ['', '# Old Heading Loses', '', 'isa dalawa tatlo'].join('\n');
 const TL_STUB_1 = [
   '---',
   'title: Mga Mapang Di-Pinalagyan',
@@ -184,11 +185,9 @@ const TL_STUB_1 = [
   'status: draft',
   'translationOf: 1/1',
   '---',
-  '',
-  '# Old Heading Loses',
-  '',
-  'isa dalawa tatlo',
+  ...TL_BODY_1.split('\n'),
 ].join('\n');
+const TL_BODY_2 = ['', '# Tahanan', '', 'apat lima anim'].join('\n');
 const TL_STUB_2 = [
   '---',
   'title: Tahanan',
@@ -197,10 +196,7 @@ const TL_STUB_2 = [
   'status: draft',
   'translationOf: 1/2',
   '---',
-  '',
-  '# Tahanan',
-  '',
-  'apat lima anim',
+  ...TL_BODY_2.split('\n'),
 ].join('\n');
 
 /**
@@ -384,6 +380,10 @@ describe('loadChaptersFromDisk', () => {
         status: 'draft',
         translationOf: '1/2',
       });
+      // Content and word counts cover the body only, never the fence.
+      expect(byKey.get('tl-1').content).toBe(TL_BODY_1);
+      expect(byKey.get('tl-2').content).toBe(TL_BODY_2);
+      expect(byKey.get('tl-2').wordCount).toBe(wc(TL_BODY_2));
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
@@ -647,9 +647,12 @@ describe('runReset', () => {
       const rebuiltTl = dbMock.store.get('novels/psychic_petals_tl/episodes/1/chapters/2');
       expect(rebuiltTl.title).toBe('Tahanan');
       expect(rebuiltTl.translationOf).toBe('1/2');
+      // Stored content is the body only — no `---` fence lines.
+      expect(rebuiltTl.content).toBe(TL_BODY_2);
       expect(dbMock.store.get('novels/psychic_petals_tl').language).toBe('tl');
       expect(dbMock.store.get('novels/psychic_petals_tl/episodes/1').totalWords)
-        .toBe(wc(TL_STUB_1) + wc(TL_STUB_2));
+        // Frontmatter is stripped; totals count body words only.
+        .toBe(wc(TL_BODY_1) + wc(TL_BODY_2));
 
       // Wipe scope: unrelated collections and novels untouched.
       expect(dbMock.store.has('novels/unrelated_novel/episodes/1/chapters/1')).toBe(true);

@@ -105,17 +105,19 @@ export function parseChapterPath(filePath) {
 }
 
 /**
- * Minimal hand-rolled YAML frontmatter parser (no dependencies).
+ * Split chapter content into its parsed frontmatter metadata and the
+ * remaining Markdown body.
  *
  * Recognises a leading `---` fence containing flat `key: value` pairs and
- * returns only the keys in FRONTMATTER_KEYS (`title`, `episode`, `chapter`,
+ * keeps only the keys in FRONTMATTER_KEYS (`title`, `episode`, `chapter`,
  * `status`, `translationOf`). Numeric values are coerced to integers,
  * surrounding quotes are stripped, and blank/unknown lines are ignored.
- * Returns null when the content has no valid frontmatter fence.
+ * Returns `{ frontmatter: null, body: content }` when the content has no
+ * valid frontmatter fence, leaving the body untouched.
  */
-export function parseFrontmatter(content) {
+export function splitFrontmatter(content) {
   const lines = content.split('\n');
-  if (lines[0]?.trim() !== '---') return null;
+  if (lines[0]?.trim() !== '---') return { frontmatter: null, body: content };
 
   let closeIndex = -1;
   for (let index = 1; index < lines.length; index += 1) {
@@ -124,9 +126,9 @@ export function parseFrontmatter(content) {
       break;
     }
   }
-  if (closeIndex === -1) return null;
+  if (closeIndex === -1) return { frontmatter: null, body: content };
 
-  const data = {};
+  const frontmatter = {};
   for (const line of lines.slice(1, closeIndex)) {
     const colonIndex = line.indexOf(':');
     if (colonIndex === -1) continue;
@@ -140,12 +142,22 @@ export function parseFrontmatter(content) {
 
     if (key === 'episode' || key === 'chapter') {
       if (!/^\d+$/.test(value)) continue;
-      data[key] = Number.parseInt(value, 10);
+      frontmatter[key] = Number.parseInt(value, 10);
       continue;
     }
-    data[key] = value;
+    frontmatter[key] = value;
   }
-  return data;
+
+  return { frontmatter, body: lines.slice(closeIndex + 1).join('\n') };
+}
+
+/**
+ * Parse only the YAML frontmatter metadata of a chapter file.
+ * Returns the recognised keys (possibly an empty object) or null when the
+ * content has no valid frontmatter fence.
+ */
+export function parseFrontmatter(content) {
+  return splitFrontmatter(content).frontmatter;
 }
 
 /**
@@ -283,16 +295,16 @@ export async function readChangedChapters(novelDir, changedFiles) {
       continue;
     }
 
-    const frontmatter = parseFrontmatter(content);
+    const { frontmatter, body } = splitFrontmatter(content);
     const location = resolveChapterLocation(pathLocation, frontmatter);
 
     chapters.push({
       ...location,
-      title: frontmatter?.title ?? extractTitle(content, `Chapter ${location.chapterNumber}`),
+      title: frontmatter?.title ?? extractTitle(body, `Chapter ${location.chapterNumber}`),
       status: frontmatter?.status ?? '',
       translationOf: frontmatter?.translationOf ?? '',
-      content,
-      wordCount: countWords(content),
+      content: body,
+      wordCount: countWords(body),
     });
   }
   return { chapters, extraDeletedFiles };

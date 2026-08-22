@@ -39,10 +39,10 @@ import {
   getAllMarkdownFiles,
   initializeFirestore,
   parseChapterPath,
-  parseFrontmatter,
   refreshEpisodeTotals,
   resolveChapterLocation,
   resolveNovelId,
+  splitFrontmatter,
   upsertChapters,
   upsertNovelDocument,
 } from './sync-novel.js';
@@ -165,16 +165,16 @@ export async function loadChaptersFromDisk(novelDir) {
       continue;
     }
 
-    const frontmatter = parseFrontmatter(content);
+    const { frontmatter, body } = splitFrontmatter(content);
     const location = resolveChapterLocation(pathLocation, frontmatter);
 
     chapters.push({
       ...location,
-      title: frontmatter?.title ?? extractTitle(content, `Chapter ${location.chapterNumber}`),
+      title: frontmatter?.title ?? extractTitle(body, `Chapter ${location.chapterNumber}`),
       status: frontmatter?.status ?? '',
       translationOf: frontmatter?.translationOf ?? '',
-      content,
-      wordCount: countWords(content),
+      content: body,
+      wordCount: countWords(body),
     });
   }
   return chapters;

@@ -6,6 +6,7 @@ import {
   parseArguments,
   parseChapterPath,
   parseFrontmatter,
+  splitFrontmatter,
   resolveChapterLocation,
   resolveNovelId,
   extractTitle,
@@ -389,6 +390,35 @@ describe('parseFrontmatter', () => {
   });
 });
 
+describe('splitFrontmatter', () => {
+  it('returns parsed metadata plus the body following the closing fence', () => {
+    const content = '---\ntitle: Tahanan\nstatus: draft\n---\n\n# Tahanan\n\nBody.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toEqual({ title: 'Tahanan', status: 'draft' });
+    expect(body).toBe('\n# Tahanan\n\nBody.');
+  });
+
+  it('leaves content untouched when there is no fence', () => {
+    const content = '# Just prose\n\n---\n\nA horizontal rule.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toBeNull();
+    expect(body).toBe(content);
+  });
+
+  it('leaves content untouched when the fence is never closed', () => {
+    const content = '---\ntitle: Unclosed\n\nBody.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toBeNull();
+    expect(body).toBe(content);
+  });
+
+  it('keeps the full body including blank lines after the fence', () => {
+    const { frontmatter, body } = splitFrontmatter('---\ntitle: X\n---\n\n\nA.\n\nB.');
+    expect(frontmatter.title).toBe('X');
+    expect(body).toBe('\n\nA.\n\nB.');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // resolveChapterLocation — frontmatter precedence over path-derived numbers
 // ---------------------------------------------------------------------------
@@ -669,6 +699,13 @@ describe('readChangedChapters', () => {
         status: 'draft',
         translationOf: '1/2',
       });
+      expect(chapters[0].content).toBe(
+        '\n# Wrong Heading That Must Lose\n\n*(Draft — hindi pa tapos.)*',
+      );
+      // Heading + placeholder words only; frontmatter tokens excluded.
+      expect(chapters[0].wordCount).toBe(
+        countWords('\n# Wrong Heading That Must Lose\n\n*(Draft — hindi pa tapos.)*'),
+      );
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
