@@ -175,7 +175,7 @@ export function extractTitle(content, fallbackTitle) {
 }
 
 /** Recursively find all Markdown files in a directory. */
-async function getAllMarkdownFiles(dir) {
+export async function getAllMarkdownFiles(dir) {
   const files = [];
   async function scan(currentDir) {
     let entries;
@@ -449,6 +449,8 @@ function initializeFirestore() {
   return getFirestore(initializeApp({ credential }));
 }
 
+export { initializeFirestore };
+
 /**
  * Calculate the total word count for an episode by summing all chapters
  * in its chapters subcollection.
@@ -547,7 +549,7 @@ export async function refreshEpisodeTotals(novelRef, episodeNumbers) {
  * Preserves existing metadata via buildNovelDocument, stamps the language
  * version, and recalculates the novel-level totalWords from all episodes.
  */
-export async function upsertNovelDocument(novelRef, { language, timestamp }) {
+export async function upsertNovelDocument(novelRef, { language, timestamp } = {}) {
   const novelSnapshot = await novelRef.get();
   const currentData = novelSnapshot.exists ? novelSnapshot.data() : {};
 
@@ -557,7 +559,15 @@ export async function upsertNovelDocument(novelRef, { language, timestamp }) {
     totalWordsNovel += doc.data().totalWords ?? 0;
   });
 
-  const novelDoc = buildNovelDocument({ currentData, timestamp, includeId: true, language });
+  // Derive the _id field from the ref so translated versions (e.g.
+  // novels/psychic_petals_tl) stamp their own suffixed ID, not the default.
+  const novelDoc = buildNovelDocument({
+    currentData,
+    timestamp,
+    includeId: true,
+    language,
+    novelId: novelRef.id,
+  });
   novelDoc.metadata.totalWords = totalWordsNovel;
   await novelRef.set(novelDoc, { merge: true });
   return novelDoc;
