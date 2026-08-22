@@ -27,8 +27,13 @@ const { dbMock } = vi.hoisted(() => {
             ref: this,
           };
         },
-        async set(data) {
-          store.set(docPath, structuredClone(data));
+        async set(data, options) {
+          // Mirror Firestore: with { merge: true } unspecified fields survive.
+          const merged =
+            options?.merge && store.has(docPath)
+              ? { ...store.get(docPath), ...structuredClone(data) }
+              : structuredClone(data);
+          store.set(docPath, merged);
         },
         async update(data) {
           if (!store.has(docPath)) {
@@ -138,6 +143,9 @@ const {
   rebuildNovel,
   runReset,
 } = await import('./reset-novel.js');
+
+// Exercised here because the mock Firestore harness lives in this file.
+const { refreshEpisodeTotals } = await import('./sync-novel.js');
 
 /** Word count helper mirroring the whitespace-splitting contract. */
 const wc = (text) => text.trim().split(/\s+/).length;
@@ -467,6 +475,28 @@ describe('wipeNovel', () => {
     const novelRef = dbMock.collection('novels').doc('never_existed');
     const wiped = await wipeNovel(novelRef);
     expect(wiped).toEqual({ deletedEpisodes: 0, deletedChapters: 0 });
+  });
+});
+
+describe('refreshEpisodeTotals', () => {
+  it('skips missing episode docs and merge-updates existing ones', async () => {
+    const novelRef = dbMock.collection('novels').doc('psychic_petals');
+    // Episode 2 exists with unrelated fields; episode 9 does not exist at all.
+    dbMock.store.set('novels/psychic_petals/episodes/2', {
+      published: true,
+      totalWords: 0,
+    });
+    dbMock.store.set('novels/psychic_petals/episodes/2/chapters/1', { wordCount: 7 });
+    dbMock.store.set('novels/psychic_petals/episodes/2/chapters/2', { wordCount: 3 });
+
+    await expect(refreshEpisodeTotals(novelRef, [2, 9])).resolves.toBeUndefined();
+
+    const refreshed = dbMock.store.get('novels/psychic_petals/episodes/2');
+    expect(refreshed.totalWords).toBe(10);
+    // Merging set preserves the other fields on an existing episode doc.
+    expect(refreshed.published).toBe(true);
+    // The missing episode was skipped instead of throwing or being created.
+    expect(dbMock.store.has('novels/psychic_petals/episodes/9')).toBe(false);
   });
 });
 

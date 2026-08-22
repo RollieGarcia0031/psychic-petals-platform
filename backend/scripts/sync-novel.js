@@ -547,12 +547,20 @@ export async function upsertChapters(db, novelRef, chapters, timestamp) {
 /**
  * Recalculate the `totalWords` rollup on each given episode from the
  * chapter docs currently stored underneath it.
+ *
+ * Episodes with no existing document are skipped — `update()` would throw
+ * NOT_FOUND on them and abort an otherwise healthy sync. Existing docs are
+ * written with a merging `set()` so other episode fields survive.
  */
 export async function refreshEpisodeTotals(novelRef, episodeNumbers) {
   for (const episodeNumber of episodeNumbers) {
     const episodeRef = novelRef.collection('episodes').doc(String(episodeNumber));
+
+    const episodeSnapshot = await episodeRef.get();
+    if (!episodeSnapshot.exists) continue;
+
     const totalWords = await calculateEpisodeTotalWords(episodeRef.collection('chapters'));
-    await episodeRef.update({ totalWords });
+    await episodeRef.set({ totalWords }, { merge: true });
   }
 }
 
