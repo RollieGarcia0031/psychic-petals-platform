@@ -16,6 +16,7 @@ import { collection, doc, getDoc, getDocs, orderBy, query } from "firebase/fires
 import { db } from "@/lib/firebase";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 type Chapter = {
   id: string;
@@ -43,7 +44,38 @@ type Novel = {
   metadata?: { tags?: string[]; totalWords?: number };
 };
 
-const novelId = process.env.NEXT_PUBLIC_NOVEL_ID ?? "psychic_petals";
+const baseNovelId = process.env.NEXT_PUBLIC_NOVEL_ID ?? "psychic_petals";
+const defaultLanguage = "en";
+const languageStorageKey = "psychic-petals:language";
+
+function novelIdForLanguage(language: string) {
+  return language === "en" ? baseNovelId : `${baseNovelId}_${language}`;
+}
+
+function sortLanguages(languages: string[]) {
+  return [...languages].sort((a, b) => {
+    if (a === b) return 0;
+    if (a === defaultLanguage) return -1;
+    if (b === defaultLanguage) return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function readStoredLanguage() {
+  try {
+    return window.localStorage.getItem(languageStorageKey);
+  } catch {
+    return null;
+  }
+}
+
+function storeLanguage(language: string) {
+  try {
+    window.localStorage.setItem(languageStorageKey, language);
+  } catch {
+    return;
+  }
+}
 
 function formatNumber(value?: number) {
   return new Intl.NumberFormat("en-US").format(value ?? 0);
@@ -64,14 +96,50 @@ export function NovelReader() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isContentsOpen, setIsContentsOpen] = useState(false);
+  const [language, setLanguage] = useState(defaultLanguage);
+  const [languages, setLanguages] = useState<string[]>([defaultLanguage]);
   const articleRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    articleRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [activeIndex]);
+    let cancelled = false;
+
+    async function discoverLanguages() {
+      const stored = readStoredLanguage();
+
+      try {
+        const snapshot = await getDocs(collection(db, "novels"));
+        const discovered = sortLanguages(
+          snapshot.docs
+            .map((docSnapshot) => docSnapshot.id)
+            .filter((id) => id === baseNovelId || id.startsWith(`${baseNovelId}_`))
+            .map((id) =>
+              id === baseNovelId ? defaultLanguage : id.slice(baseNovelId.length + 1),
+            ),
+        );
+
+        if (cancelled) return;
+
+        const available = discovered.length > 0 ? discovered : [defaultLanguage];
+        setLanguages(available);
+        if (stored && available.includes(stored)) {
+          setLanguage(stored);
+        }
+      } catch {
+        if (!cancelled) {
+          setLanguages([defaultLanguage]);
+        }
+      }
+    }
+
+    void discoverLanguages();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     async function loadNovel() {
+      const novelId = novelIdForLanguage(language);
       try {
         setIsLoading(true);
         setError(null);
@@ -114,14 +182,24 @@ export function NovelReader() {
     }
 
     void loadNovel();
-  }, []);
+  }, [language]);
+
+  function selectLanguage(nextLanguage: string) {
+    setLanguage(nextLanguage);
+    storeLanguage(nextLanguage);
+  }
 
   const chapters = useMemo(
     () => episodes.flatMap((episode) => episode.chapters.map((chapter) => ({ ...chapter, episode }))),
     [episodes],
   );
-  const chapter = chapters[activeIndex];
-  const progress = chapters.length ? ((activeIndex + 1) / chapters.length) * 100 : 0;
+  const activeIndexSafe = Math.min(activeIndex, Math.max(chapters.length - 1, 0));
+  const chapter = chapters[activeIndexSafe];
+  const progress = chapters.length ? ((activeIndexSafe + 1) / chapters.length) * 100 : 0;
+
+  useEffect(() => {
+    articleRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [activeIndexSafe]);
 
   function openChapter(index: number) {
     setActiveIndex(index);
@@ -151,9 +229,30 @@ export function NovelReader() {
             <span>{novel?.author ?? "Psychic Petals"}</span>
           </div>
 
-          <Button variant="outline" size="sm" onClick={() => setIsContentsOpen(true)} className="border-[#201d1b]/10 bg-white/60 px-3 text-[#3c3733] hover:bg-white">
-            <Menu data-icon="inline-start" /> Contents
-          </Button>
+          <div className="flex items-center gap-2 sm:gap-3">
+            {languages.length > 1 && (
+              <Tabs value={language} onValueChange={(value) => selectLanguage(String(value))}>
+                <TabsList
+                  aria-label="Reading language"
+                  className="h-9 rounded-xl border border-[#201d1b]/10 bg-[#fffdf9]/70 p-0.5"
+                >
+                  {languages.map((code) => (
+                    <TabsTrigger
+                      key={code}
+                      value={code}
+                      title={code === "en" ? "English" : code === "tl" ? "Tagalog" : code}
+                      className="h-full rounded-lg px-3 text-xs font-semibold uppercase tracking-wide text-[#625b55]"
+                    >
+                      {code}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+            )}
+            <Button variant="outline" size="sm" onClick={() => setIsContentsOpen(true)} className="border-[#201d1b]/10 bg-white/60 px-3 text-[#3c3733] hover:bg-white">
+              <Menu data-icon="inline-start" /> Contents
+            </Button>
+          </div>
         </div>
         <div className="h-px bg-[#201d1b]/8"><div className="h-full bg-[#a56c48] transition-all duration-500" style={{ width: `${progress}%` }} /></div>
       </header>
@@ -161,7 +260,7 @@ export function NovelReader() {
       <section className="relative mx-auto flex max-w-7xl gap-10 px-4 py-8 sm:px-6 lg:px-8">
         <aside className="sticky top-24 hidden h-fit w-64 shrink-0 lg:block">
           <p className="mb-4 px-3 text-[11px] font-bold uppercase tracking-[0.18em] text-[#8a8077]">Table of contents</p>
-          <ChapterList episodes={episodes} activeIndex={activeIndex} onSelect={openChapter} />
+          <ChapterList episodes={episodes} activeIndex={activeIndexSafe} onSelect={openChapter} />
         </aside>
 
         <div className="min-w-0 flex-1">
@@ -181,16 +280,16 @@ export function NovelReader() {
                 <div className="flex items-center justify-center border-t border-[#201d1b]/7 px-7 py-5 text-xs font-medium text-[#8a8077]">✦</div>
               </div>
               <nav className="mt-7 flex items-center justify-between gap-3" aria-label="Chapter navigation">
-                <Button variant="outline" size="lg" disabled={activeIndex === 0} onClick={() => openChapter(activeIndex - 1)} className="border-[#201d1b]/10 bg-white/60 px-4"><ArrowLeft data-icon="inline-start" /> Previous</Button>
-                <span className="text-center text-xs font-medium text-[#837971]">{activeIndex + 1} <span className="text-[#b3aaa2]">/</span> {chapters.length}</span>
-                <Button size="lg" disabled={activeIndex === chapters.length - 1} onClick={() => openChapter(activeIndex + 1)} className="bg-[#2d2926] px-4 text-[#fdfaf5] hover:bg-[#4a413b]">Next <ArrowRight data-icon="inline-end" /></Button>
+                <Button variant="outline" size="lg" disabled={activeIndexSafe === 0} onClick={() => openChapter(activeIndexSafe - 1)} className="border-[#201d1b]/10 bg-white/60 px-4"><ArrowLeft data-icon="inline-start" /> Previous</Button>
+                <span className="text-center text-xs font-medium text-[#837971]">{activeIndexSafe + 1} <span className="text-[#b3aaa2]">/</span> {chapters.length}</span>
+                <Button size="lg" disabled={activeIndexSafe === chapters.length - 1} onClick={() => openChapter(activeIndexSafe + 1)} className="bg-[#2d2926] px-4 text-[#fdfaf5] hover:bg-[#4a413b]">Next <ArrowRight data-icon="inline-end" /></Button>
               </nav>
             </article>
           )}
         </div>
       </section>
 
-      {isContentsOpen && <div className="fixed inset-0 z-50 lg:hidden"><button aria-label="Close table of contents" className="absolute inset-0 bg-[#211c18]/25 backdrop-blur-sm" onClick={() => setIsContentsOpen(false)} /><aside className="absolute inset-y-0 right-0 w-[min(23rem,88vw)] overflow-y-auto bg-[#fffdf9] p-5 shadow-2xl"><div className="mb-6 flex items-center justify-between"><span className="font-serif text-xl">Contents</span><Button variant="ghost" size="icon" onClick={() => setIsContentsOpen(false)}><X /></Button></div><ChapterList episodes={episodes} activeIndex={activeIndex} onSelect={openChapter} /></aside></div>}
+      {isContentsOpen && <div className="fixed inset-0 z-50 lg:hidden"><button aria-label="Close table of contents" className="absolute inset-0 bg-[#211c18]/25 backdrop-blur-sm" onClick={() => setIsContentsOpen(false)} /><aside className="absolute inset-y-0 right-0 w-[min(23rem,88vw)] overflow-y-auto bg-[#fffdf9] p-5 shadow-2xl"><div className="mb-6 flex items-center justify-between"><span className="font-serif text-xl">Contents</span><Button variant="ghost" size="icon" onClick={() => setIsContentsOpen(false)}><X /></Button></div><ChapterList episodes={episodes} activeIndex={activeIndexSafe} onSelect={openChapter} /></aside></div>}
     </main>
   );
 }
