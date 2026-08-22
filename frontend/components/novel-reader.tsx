@@ -121,9 +121,14 @@ export function NovelReader() {
 
         const available = discovered.length > 0 ? discovered : [defaultLanguage];
         setLanguages(available);
-        if (stored && available.includes(stored)) {
-          setLanguage(stored);
-        }
+
+        const nextLanguage =
+          stored && available.includes(stored)
+            ? stored
+            : available.includes(defaultLanguage)
+              ? defaultLanguage
+              : available[0];
+        setLanguage(nextLanguage);
       } catch {
         if (!cancelled) {
           setLanguages([defaultLanguage]);
@@ -138,6 +143,8 @@ export function NovelReader() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
     async function loadNovel() {
       const novelId = novelIdForLanguage(language);
       try {
@@ -145,6 +152,8 @@ export function NovelReader() {
         setError(null);
         const novelRef = doc(db, "novels", novelId);
         const novelSnapshot = await getDoc(novelRef);
+
+        if (cancelled) return;
 
         if (!novelSnapshot.exists()) {
           throw new Error(`The novel \"${novelId}\" could not be found.`);
@@ -171,17 +180,25 @@ export function NovelReader() {
           }),
         );
 
+        if (cancelled) return;
+
         setNovel(novelSnapshot.data() as Novel);
         setEpisodes(loadedEpisodes.filter((episode) => episode.published));
       } catch (loadError) {
         console.error("Unable to load novel from Firestore", loadError);
+        if (cancelled) return;
         setError(loadError instanceof Error ? loadError.message : "Unable to load this novel.");
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     }
 
     void loadNovel();
+    return () => {
+      cancelled = true;
+    };
   }, [language]);
 
   function selectLanguage(nextLanguage: string) {
