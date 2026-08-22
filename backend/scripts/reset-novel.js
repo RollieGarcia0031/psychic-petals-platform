@@ -103,8 +103,19 @@ export function parseResetArguments(argv) {
  * English always targets the base document; every other discovered language
  * targets its `{novelId}_{lang}` suffix. With a `--lang` filter only that
  * single version is selected.
+ *
+ * An explicit `--lang` must match at least one chapter file on disk — a
+ * filtered reset with zero source files would wipe the target document and
+ * rebuild nothing, so it is refused instead.
  */
 export function discoverResetTargets(chapters, baseNovelId, langFilter = null) {
+  if (langFilter && !chapters.some((chapter) => chapter.language === langFilter)) {
+    throw new Error(
+      `No ${langFilter} chapter files found under main/; refusing to reset ` +
+        `novels/${resolveNovelId(baseNovelId, langFilter)}.`,
+    );
+  }
+
   const languages = new Set(['en']);
   for (const chapter of chapters) {
     languages.add(chapter.language);

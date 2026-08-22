@@ -318,10 +318,22 @@ describe('discoverResetTargets', () => {
     ]);
   });
 
+  it('refuses a lang filter that matches no chapter on disk', () => {
+    expect(() => discoverResetTargets(chapters, 'psychic_petals', 'ja')).toThrow(
+      /No ja chapter files found/,
+    );
+    // Also refuses the base language when zero English chapters exist.
+    expect(() => discoverResetTargets([{ language: 'tl' }], 'psychic_petals', 'en')).toThrow(
+      /No en chapter files found/,
+    );
+  });
+
   it('handles an empty disk scan by still offering the base version', () => {
     expect(discoverResetTargets([], 'psychic_petals')).toEqual([
       { language: 'en', novelId: 'psychic_petals' },
     ]);
+    // …but an explicit filter on an empty scan has nothing to rebuild from.
+    expect(() => discoverResetTargets([], 'psychic_petals', 'tl')).toThrow(/No tl chapter files/);
   });
 });
 
