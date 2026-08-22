@@ -1,6 +1,8 @@
 import { FieldValue } from 'firebase-admin/firestore';
 
-const NOVEL_ID = 'psychic_petals';
+/** Default Firestore document ID for the canonical English novel version. */
+export const DEFAULT_NOVEL_ID = 'psychic_petals';
+
 const NOVEL_TITLE = 'Psychic Petals';
 
 /**
@@ -58,8 +60,21 @@ export function validateNovelPayload(body) {
  * @param {object} [opts.body] - Request body (API routes).
  * @param {string|FieldValue} opts.timestamp - ISO string or FieldValue.serverTimestamp().
  * @param {boolean} [opts.includeId=false] - Include _id field (sync script only).
+ * @param {string} [opts.novelId=DEFAULT_NOVEL_ID] - Novel document ID used for
+ *   the `_id` field (sync script). Language versions pass their suffixed ID
+ *   (e.g. `psychic_petals_tl`).
+ * @param {string} [opts.language] - ISO 639-1 code of this version's language
+ *   (sync script only, e.g. `"en"`, `"tl"`). Falls back to a `language` field
+ *   already present on `currentData`; omitted when neither is provided.
  */
-export function buildNovelDocument({ currentData, body, timestamp, includeId = false }) {
+export function buildNovelDocument({
+  currentData,
+  body,
+  timestamp,
+  includeId = false,
+  novelId = DEFAULT_NOVEL_ID,
+  language,
+}) {
   if (!body) {
     // Sync script path: merge existing data with defaults
     const doc = {
@@ -77,8 +92,12 @@ export function buildNovelDocument({ currentData, body, timestamp, includeId = f
         totalWords: 0,
       },
     };
+    const resolvedLanguage = language ?? currentData?.language;
+    if (resolvedLanguage) {
+      doc.language = resolvedLanguage;
+    }
     if (includeId) {
-      doc._id = NOVEL_ID;
+      doc._id = novelId;
     }
     return doc;
   }

@@ -5,15 +5,16 @@ import path from 'node:path';
 import process from 'node:process';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
-import { buildNovelDocument } from '../utils/novelUtils.js';
-
-const NOVEL_ID = 'psychic_petals';
+import { DEFAULT_NOVEL_ID, buildNovelDocument } from '../utils/novelUtils.js';
 
 /** Maximum size in bytes of a single chapter file before it is rejected. */
 export const MAX_FILE_SIZE = 512 * 1024;
 
 /** Maximum operations allowed in a single Firestore batch (Firestore caps at 500). */
 export const MAX_BATCH_OPERATIONS = 500;
+
+/** Frontmatter keys recognised by the chapter parser; everything else is ignored. */
+const FRONTMATTER_KEYS = new Set(['title', 'episode', 'chapter', 'status', 'translationOf']);
 
 /** Split an array into chunks of at most `size` items each. */
 export function chunk(array, size) {
@@ -49,8 +50,14 @@ export function parseArguments(argv) {
     throw new Error('Missing required --novel-dir argument.');
   }
 
+  const novelId = options['novel-id']?.trim();
+  if (options['novel-id'] !== undefined && !novelId) {
+    throw new Error('--novel-id must not be empty.');
+  }
+
   return {
     novelDir: options['novel-dir'],
+    novelId: novelId || DEFAULT_NOVEL_ID,
     changedFiles: (options.changed ?? '')
       .split(',')
       .map((file) => file.trim())
@@ -63,24 +70,107 @@ export function parseArguments(argv) {
 }
 
 /**
+ * Resolve the Firestore novel document ID for a story language.
+ *
+ * English (explicit prefix or legacy bare layout) maps to the base novel ID;
+ * every other language gets its own suffixed document (e.g. `psychic_petals_tl`).
+ */
+export function resolveNovelId(baseNovelId, language) {
+  if (!language || language === 'en') return baseNovelId;
+  return `${baseNovelId}_${language}`;
+}
+
+/**
  * Convert a story path into its Firestore location.
  *
- * Story files use the canonical flat layout main/episode-NN/NN-slug.md.
- * Both numeric prefixes are required so Firestore locations remain stable.
+ * Accepted layouts (both numeric prefixes required for stable locations):
+ *   main/episode-NN/NN-slug.md        (legacy English)
+ *   main/en/episode-NN/NN-slug.md     (English)
+ *   main/tl/episode-NN/NN-slug.md     (any two-letter lowercase language prefix)
+ *
+ * The returned `language` defaults to 'en' for legacy unprefixed paths.
  */
 export function parseChapterPath(filePath) {
   // Normalise separators so the regex works on any platform.
   const normalizedPath = filePath.split(path.sep).join('/').replace(/\\/g, '/');
-  const directMatch = normalizedPath.match(/^main\/episode-(\d+)\/(\d+)-(.+)\.md$/);
-  if (directMatch) {
-    return {
-      episodeNumber: Number.parseInt(directMatch[1], 10),
-      chapterNumber: Number.parseInt(directMatch[2], 10),
-      slug: directMatch[3],
-    };
+  const match = normalizedPath.match(/^main(?:\/([a-z]{2}))?\/episode-(\d+)\/(\d+)-(.+)\.md$/);
+  if (!match) return null;
+
+  return {
+    language: match[1] ?? 'en',
+    episodeNumber: Number.parseInt(match[2], 10),
+    chapterNumber: Number.parseInt(match[3], 10),
+    slug: match[4],
+  };
+}
+
+/**
+ * Split chapter content into its parsed frontmatter metadata and the
+ * remaining Markdown body.
+ *
+ * Recognises a leading `---` fence containing flat `key: value` pairs and
+ * keeps only the keys in FRONTMATTER_KEYS (`title`, `episode`, `chapter`,
+ * `status`, `translationOf`). Numeric values are coerced to integers,
+ * surrounding quotes are stripped, and blank/unknown lines are ignored.
+ * Returns `{ frontmatter: null, body: content }` when the content has no
+ * valid frontmatter fence, leaving the body untouched.
+ */
+export function splitFrontmatter(content) {
+  const lines = content.split('\n');
+  if (lines[0]?.trim() !== '---') return { frontmatter: null, body: content };
+
+  let closeIndex = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === '---') {
+      closeIndex = index;
+      break;
+    }
+  }
+  if (closeIndex === -1) return { frontmatter: null, body: content };
+
+  const frontmatter = {};
+  for (const line of lines.slice(1, closeIndex)) {
+    const colonIndex = line.indexOf(':');
+    if (colonIndex === -1) continue;
+
+    const key = line.slice(0, colonIndex).trim();
+    if (!FRONTMATTER_KEYS.has(key)) continue;
+
+    const rawValue = line.slice(colonIndex + 1).trim();
+    if (!rawValue) continue;
+    const value = rawValue.replace(/^(['"])(.*)\1$/, '$2');
+
+    if (key === 'episode' || key === 'chapter') {
+      if (!/^\d+$/.test(value)) continue;
+      frontmatter[key] = Number.parseInt(value, 10);
+      continue;
+    }
+    frontmatter[key] = value;
   }
 
-  return null;
+  return { frontmatter, body: lines.slice(closeIndex + 1).join('\n') };
+}
+
+/**
+ * Parse only the YAML frontmatter metadata of a chapter file.
+ * Returns the recognised keys (possibly an empty object) or null when the
+ * content has no valid frontmatter fence.
+ */
+export function parseFrontmatter(content) {
+  return splitFrontmatter(content).frontmatter;
+}
+
+/**
+ * Merge frontmatter overrides into a path-derived location.
+ * Frontmatter values win; absent values keep the path-derived ones.
+ */
+export function resolveChapterLocation(pathLocation, frontmatter) {
+  if (!frontmatter) return { ...pathLocation };
+  return {
+    ...pathLocation,
+    episodeNumber: frontmatter.episode ?? pathLocation.episodeNumber,
+    chapterNumber: frontmatter.chapter ?? pathLocation.chapterNumber,
+  };
 }
 
 /** Extract a readable chapter title from the first level-one Markdown heading. */
@@ -97,7 +187,7 @@ export function extractTitle(content, fallbackTitle) {
 }
 
 /** Recursively find all Markdown files in a directory. */
-async function getAllMarkdownFiles(dir) {
+export async function getAllMarkdownFiles(dir) {
   const files = [];
   async function scan(currentDir) {
     let entries;
@@ -150,8 +240,8 @@ export async function readChangedChapters(novelDir, changedFiles) {
   }
 
   for (const filePath of changedFiles) {
-    const location = parseChapterPath(filePath);
-    if (!location) {
+    const pathLocation = parseChapterPath(filePath);
+    if (!pathLocation) {
       console.warn(`Skipping unsupported story path: ${filePath}`);
       continue;
     }
@@ -205,11 +295,16 @@ export async function readChangedChapters(novelDir, changedFiles) {
       continue;
     }
 
+    const { frontmatter, body } = splitFrontmatter(content);
+    const location = resolveChapterLocation(pathLocation, frontmatter);
+
     chapters.push({
       ...location,
-      title: extractTitle(content, `Chapter ${location.chapterNumber}`),
-      content,
-      wordCount: countWords(content),
+      title: frontmatter?.title ?? extractTitle(body, `Chapter ${location.chapterNumber}`),
+      status: frontmatter?.status ?? '',
+      translationOf: frontmatter?.translationOf ?? '',
+      content: body,
+      wordCount: countWords(body),
     });
   }
   return { chapters, extraDeletedFiles };
@@ -237,6 +332,110 @@ export async function deleteChapters(novelRef, deletedFiles) {
   return deletedChapters;
 }
 
+/**
+ * Bucket chapters by the Firestore novel document they belong to.
+ * Returns `{ [resolvedNovelId]: { language, chapters[] } }` so each language
+ * version can be reconciled independently.
+ */
+export function groupChaptersByNovel(chapters, baseNovelId) {
+  const groups = {};
+  for (const chapter of chapters) {
+    const novelId = resolveNovelId(baseNovelId, chapter.language);
+    if (!groups[novelId]) {
+      groups[novelId] = { language: chapter.language, chapters: [] };
+    }
+    groups[novelId].chapters.push(chapter);
+  }
+  return groups;
+}
+
+/**
+ * Group deleted story paths by their resolved novel document ID so deletions
+ * land in the correct language version. Unparsable paths are skipped — they
+ * never mapped to a chapter document in the first place.
+ */
+export function groupDeletedFilesByNovel(deletedFiles, baseNovelId) {
+  const groups = {};
+  for (const filePath of deletedFiles) {
+    const location = parseChapterPath(filePath);
+    if (!location) {
+      console.warn(`Skipping unsupported deleted story path: ${filePath}`);
+      continue;
+    }
+    const novelId = resolveNovelId(baseNovelId, location.language);
+    if (!groups[novelId]) {
+      groups[novelId] = { language: location.language, files: [] };
+    }
+    groups[novelId].files.push(filePath);
+  }
+  return groups;
+}
+
+/**
+ * Scan every Markdown file under `novelDir/main` and build the set of chapter
+ * keys that exist on disk, bucketed per resolved novel document ID. Frontmatter
+ * overrides are applied exactly as during upserts so reconciliation compares
+ * like with like. Empty or unreadable files are skipped (they count as absent).
+ *
+ * Returns `{ [resolvedNovelId]: Set<'episode-chapter'> }`.
+ */
+export async function scanExistingChapters(novelDir, baseNovelId) {
+  const mainDir = path.resolve(novelDir, 'main');
+  const files = await getAllMarkdownFiles(mainDir);
+
+  const keysByNovel = {};
+  for (const file of files) {
+    const relativePath = path.relative(novelDir, file);
+    const pathLocation = parseChapterPath(relativePath);
+    if (!pathLocation) continue;
+
+    let content = '';
+    try {
+      content = await readFile(file, 'utf8');
+    } catch {
+      console.warn(`Reconciliation scan: skipping unreadable file: ${relativePath}`);
+      continue;
+    }
+    if (!content.trim()) continue;
+
+    const location = resolveChapterLocation(pathLocation, parseFrontmatter(content));
+    const novelId = resolveNovelId(baseNovelId, location.language);
+    if (!keysByNovel[novelId]) keysByNovel[novelId] = new Set();
+    keysByNovel[novelId].add(`${location.episodeNumber}-${location.chapterNumber}`);
+  }
+  return keysByNovel;
+}
+
+/**
+ * Reconciliation for one novel document: delete every chapter doc under
+ * `novelRef` whose `episode-chapter` key is not present in `existingKeys`.
+ * Returns the removed locations so callers can refresh affected rollups.
+ */
+export async function deleteOrphanedChapters(novelRef, existingKeys) {
+  const removedChapters = [];
+  const episodesSnapshot = await novelRef.collection('episodes').get();
+
+  for (const epDoc of episodesSnapshot.docs) {
+    const epNum = Number.parseInt(epDoc.id, 10);
+    if (Number.isNaN(epNum)) continue;
+
+    const chaptersSnapshot = await epDoc.ref.collection('chapters').get();
+    for (const chDoc of chaptersSnapshot.docs) {
+      const chNum = Number.parseInt(chDoc.id, 10);
+      if (Number.isNaN(chNum)) continue;
+
+      if (!existingKeys.has(`${epNum}-${chNum}`)) {
+        console.warn(
+          `Reconciliation: deleting orphaned chapter doc from Firestore: episode ${epNum}, chapter ${chNum}`,
+        );
+        await chDoc.ref.delete();
+        removedChapters.push({ episodeNumber: epNum, chapterNumber: chNum });
+      }
+    }
+  }
+  return removedChapters;
+}
+
 function initializeFirestore() {
   if (getApps().length > 0) return getFirestore();
 
@@ -262,11 +461,13 @@ function initializeFirestore() {
   return getFirestore(initializeApp({ credential }));
 }
 
+export { initializeFirestore };
+
 /**
  * Calculate the total word count for an episode by summing all chapters
  * in its chapters subcollection.
  */
-async function calculateEpisodeTotalWords(chaptersRef) {
+export async function calculateEpisodeTotalWords(chaptersRef) {
   const snapshot = await chaptersRef.orderBy('chapterNumber').get();
   let totalWords = 0;
   snapshot.forEach((doc) => {
@@ -275,66 +476,15 @@ async function calculateEpisodeTotalWords(chaptersRef) {
   return totalWords;
 }
 
-async function main() {
-  const { novelDir, changedFiles, deletedFiles } = parseArguments(process.argv.slice(2));
-  if (changedFiles.length === 0 && deletedFiles.length === 0) {
-    console.log('No changed or deleted Markdown files supplied; nothing to sync.');
-    return;
-  }
-
-  const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, changedFiles);
-  const allDeletedFiles = [...deletedFiles, ...extraDeletedFiles];
-
-  if (chapters.length === 0 && allDeletedFiles.length === 0) {
-    console.log('No supported chapter files to sync or delete.');
-    return;
-  }
-
-  const db = initializeFirestore();
-  const novelRef = db.collection('novels').doc(NOVEL_ID);
-  const timestamp = new Date().toISOString();
-
-  // Track which episode numbers were touched so we can recalc their totals
+/**
+ * Batch-upsert chapters into `novelRef`, grouping them per episode and
+ * auto-creating any missing episode document along the way. Existing chapter
+ * docs are read first so API-managed fields (especially `notes`) survive.
+ *
+ * Returns the set of touched episode numbers so callers can refresh rollups.
+ */
+export async function upsertChapters(db, novelRef, chapters, timestamp) {
   const touchedEpisodeNumbers = new Set();
-
-  // Delete removed chapters first
-  const deletedChapters = await deleteChapters(novelRef, allDeletedFiles);
-  for (const del of deletedChapters) {
-    touchedEpisodeNumbers.add(del.episodeNumber);
-  }
-
-  // Reconciliation: find and delete any other chapters in DB that do not exist on disk
-  const mainDir = path.resolve(novelDir, 'main');
-  const allFiles = await getAllMarkdownFiles(mainDir);
-  const existingChapters = new Set();
-  for (const file of allFiles) {
-    const relativePath = path.relative(novelDir, file);
-    const loc = parseChapterPath(relativePath);
-    if (loc) {
-      existingChapters.add(`${loc.episodeNumber}-${loc.chapterNumber}`);
-    }
-  }
-
-  const reconcileEpisodesSnapshot = await novelRef.collection('episodes').get();
-  for (const epDoc of reconcileEpisodesSnapshot.docs) {
-    const epNumStr = epDoc.id;
-    const epNum = Number.parseInt(epNumStr, 10);
-    if (Number.isNaN(epNum)) continue;
-
-    const chaptersSnapshot = await epDoc.ref.collection('chapters').get();
-    for (const chDoc of chaptersSnapshot.docs) {
-      const chNumStr = chDoc.id;
-      const chNum = Number.parseInt(chNumStr, 10);
-      if (Number.isNaN(chNum)) continue;
-
-      const key = `${epNum}-${chNum}`;
-      if (!existingChapters.has(key)) {
-        console.warn(`Reconciliation: Deleting orphaned chapter doc from Firestore: episode ${epNum}, chapter ${chNum}`);
-        await chDoc.ref.delete();
-        touchedEpisodeNumbers.add(epNum);
-      }
-    }
-  }
 
   // Group chapters by episode for batch-friendly processing
   const chaptersByEpisode = {};
@@ -345,12 +495,8 @@ async function main() {
     touchedEpisodeNumbers.add(epNum);
   }
 
-  // ── Step 1: Upsert chapters into the correct subcollection paths ──────
-  //
-  //   novels/{novelId}/episodes/{episodeNumber}/chapters/{chapterNumber}
-  //
   for (const [episodeNumber, episodeChapters] of Object.entries(chaptersByEpisode)) {
-    const episodeRef = novelRef.collection('episodes').doc(episodeNumber);
+    const episodeRef = novelRef.collection('episodes').doc(episodeNumber.toString());
 
     // Auto-create episode document if it doesn't exist yet
     const episodeSnapshot = await episodeRef.get();
@@ -386,45 +532,161 @@ async function main() {
           wordCount: chapter.wordCount,
           lastEdited: timestamp,
           notes: existing.notes ?? '',
+          language: chapter.language,
+          status: chapter.status ?? '',
+          translationOf: chapter.translationOf ?? '',
         });
       }
       await batch.commit();
     }
   }
 
-  // ── Step 2: Recalculate word counts for each touched episode ──────────
-  //
-  //   novels/{novelId}/episodes/{episodeNumber}
-  //
-  for (const epNum of touchedEpisodeNumbers) {
-    const episodeRef = novelRef.collection('episodes').doc(String(epNum));
-    const chaptersRef = episodeRef.collection('chapters');
-    const totalWords = await calculateEpisodeTotalWords(chaptersRef);
-    await episodeRef.update({ totalWords });
+  return touchedEpisodeNumbers;
+}
+
+/**
+ * Recalculate the `totalWords` rollup on each given episode from the
+ * chapter docs currently stored underneath it.
+ *
+ * Episodes with no existing document are skipped — `update()` would throw
+ * NOT_FOUND on them and abort an otherwise healthy sync. Existing docs are
+ * written with a merging `set()` so other episode fields survive.
+ */
+export async function refreshEpisodeTotals(novelRef, episodeNumbers) {
+  for (const episodeNumber of episodeNumbers) {
+    const episodeRef = novelRef.collection('episodes').doc(String(episodeNumber));
+
+    const episodeSnapshot = await episodeRef.get();
+    if (!episodeSnapshot.exists) continue;
+
+    const totalWords = await calculateEpisodeTotalWords(episodeRef.collection('chapters'));
+    await episodeRef.set({ totalWords }, { merge: true });
   }
+}
 
-  // ── Step 3: Upsert the root-level novel metadata document ─────────────
-  //
-  //   novels/{novelId}
-  //
+/**
+ * Upsert the root-level novel metadata document (`novels/{novelId}`).
+ * Preserves existing metadata via buildNovelDocument, stamps the language
+ * version, and recalculates the novel-level totalWords from all episodes.
+ */
+export async function upsertNovelDocument(novelRef, { language, timestamp } = {}) {
   const novelSnapshot = await novelRef.get();
-  const currentNovel = novelSnapshot.exists ? novelSnapshot.data() : {};
+  const currentData = novelSnapshot.exists ? novelSnapshot.data() : {};
 
-  // Recalculate novel-level totalWords from all episodes
   const episodesSnapshot = await novelRef.collection('episodes').get();
   let totalWordsNovel = 0;
   episodesSnapshot.forEach((doc) => {
     totalWordsNovel += doc.data().totalWords ?? 0;
   });
 
-  const novelDoc = buildNovelDocument({ currentData: currentNovel, timestamp, includeId: true });
+  // Derive the _id field from the ref so translated versions (e.g.
+  // novels/psychic_petals_tl) stamp their own suffixed ID, not the default.
+  const novelDoc = buildNovelDocument({
+    currentData,
+    timestamp,
+    includeId: true,
+    language,
+    novelId: novelRef.id,
+  });
   novelDoc.metadata.totalWords = totalWordsNovel;
   await novelRef.set(novelDoc, { merge: true });
+  return novelDoc;
+}
 
-  const epLog = [...touchedEpisodeNumbers].sort((a, b) => a - b).join(', ');
-  console.log(
-    `Synced ${chapters.length} chapter(s) and deleted ${deletedChapters.length} chapter(s) to novels/${NOVEL_ID} (episodes: ${epLog}).`,
-  );
+/**
+ * Sync pipeline shared by the CLI entry point and tests: route changed and
+ * deleted chapter files into their per-language novel documents, reconcile
+ * stored chapters against the disk scan, and refresh affected rollups.
+ */
+export async function syncChangedFiles({ novelDir, novelId, changedFiles, deletedFiles }) {
+  const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, changedFiles);
+  const allDeletedFiles = [...deletedFiles, ...extraDeletedFiles];
+
+  if (chapters.length === 0 && allDeletedFiles.length === 0) {
+    console.log('No supported chapter files to sync or delete.');
+    return;
+  }
+
+  // Route work per language version: en/bare files target the base novel doc,
+  // other prefixes target their own `{novelId}_{lang}` documents.
+  const chapterGroups = groupChaptersByNovel(chapters, novelId);
+  const deletionGroups = groupDeletedFilesByNovel(allDeletedFiles, novelId);
+  const targetNovelIds = [
+    ...new Set([...Object.keys(chapterGroups), ...Object.keys(deletionGroups)]),
+  ];
+
+  const db = initializeFirestore();
+  const timestamp = new Date().toISOString();
+
+  // One disk scan shared by all versions; each novel reconciles independently
+  // against its own slice so languages self-heal without clobbering each other.
+  const keysByNovel = await scanExistingChapters(novelDir, novelId);
+
+  // A scan that produced no chapter keys at all means main/ is missing,
+  // empty, or holds no parseable chapters — almost always a wrong
+  // --novel-dir or a broken checkout rather than a deliberate wipe of every
+  // version. Reconciliation is skipped so a misdirected run cannot delete
+  // all stored chapters. Explicit per-file deletions below still apply, and
+  // any non-empty scan keeps reconciling normally (per-language empties
+  // included).
+  const scanHasAnyChapters = Object.keys(keysByNovel).length > 0;
+  if (!scanHasAnyChapters) {
+    console.warn(
+      'Reconciliation skipped: scan found no chapter files under main/. ' +
+        'Stored chapters will not be deleted.',
+    );
+  }
+
+  for (const groupNovelId of targetNovelIds) {
+    const language =
+      chapterGroups[groupNovelId]?.language ?? deletionGroups[groupNovelId].language;
+    const novelRef = db.collection('novels').doc(groupNovelId);
+
+    // Delete chapters whose files were explicitly reported as removed
+    const deletedChapters = await deleteChapters(
+      novelRef,
+      deletionGroups[groupNovelId]?.files ?? [],
+    );
+
+    // Reconciliation: remove this novel's docs that no longer exist on disk
+    const orphanedChapters = scanHasAnyChapters
+      ? await deleteOrphanedChapters(novelRef, keysByNovel[groupNovelId] ?? new Set())
+      : [];
+
+    // Upsert changed chapters into the correct subcollection paths:
+    //   novels/{novelId}/episodes/{episodeNumber}/chapters/{chapterNumber}
+    const upsertedEpisodes = await upsertChapters(
+      db,
+      novelRef,
+      chapterGroups[groupNovelId]?.chapters ?? [],
+      timestamp,
+    );
+
+    // Recalculate word counts for every touched or drained episode
+    const affectedEpisodes = new Set(upsertedEpisodes);
+    for (const location of [...deletedChapters, ...orphanedChapters]) {
+      affectedEpisodes.add(location.episodeNumber);
+    }
+    await refreshEpisodeTotals(novelRef, affectedEpisodes);
+
+    // Root-level novel metadata document
+    await upsertNovelDocument(novelRef, { language, timestamp });
+
+    const removedCount = deletedChapters.length + orphanedChapters.length;
+    const epLog = [...affectedEpisodes].sort((a, b) => a - b).join(', ') || 'none';
+    console.log(
+      `Synced novels/${groupNovelId} (${language}): ${upsertedEpisodes.size > 0 ? chapterGroups[groupNovelId].chapters.length : 0} chapter(s) written, ${removedCount} chapter(s) removed (episodes: ${epLog}).`,
+    );
+  }
+}
+
+async function main() {
+  const { novelDir, novelId, changedFiles, deletedFiles } = parseArguments(process.argv.slice(2));
+  if (changedFiles.length === 0 && deletedFiles.length === 0) {
+    console.log('No changed or deleted Markdown files supplied; nothing to sync.');
+    return;
+  }
+  await syncChangedFiles({ novelDir, novelId, changedFiles, deletedFiles });
 }
 
 if (

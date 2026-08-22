@@ -1,19 +1,160 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll, beforeAll } from 'vitest';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Firestore mock harness for the syncChangedFiles pipeline tests — a minimal
+// in-memory document store mimicking the firebase-admin API subset used by
+// scripts/sync-novel.js. Defined inside vi.hoisted so the module mocks below
+// can reference it.
+// ---------------------------------------------------------------------------
+const { dbMock } = vi.hoisted(() => {
+  function createSyncFirestoreMock() {
+    const store = new Map();
+    const deletedPaths = [];
+
+    const docRef = (segments) => {
+      const docPath = segments.join('/');
+      return {
+        path: docPath,
+        id: segments[segments.length - 1],
+        async get() {
+          const exists = store.has(docPath);
+          return {
+            exists,
+            id: this.id,
+            data: () => (exists ? structuredClone(store.get(docPath)) : undefined),
+            ref: this,
+          };
+        },
+        async set(data, options) {
+          const merged =
+            options?.merge && store.has(docPath)
+              ? { ...store.get(docPath), ...structuredClone(data) }
+              : structuredClone(data);
+          store.set(docPath, merged);
+        },
+        async update(data) {
+          if (!store.has(docPath)) {
+            throw new Error(`update() on missing document: ${docPath}`);
+          }
+          store.set(docPath, { ...store.get(docPath), ...structuredClone(data) });
+        },
+        async delete() {
+          deletedPaths.push(docPath);
+          store.delete(docPath);
+        },
+        collection(name) {
+          return collectionRef([...segments, name]);
+        },
+      };
+    };
+
+    const collectionRef = (segments) => {
+      const collPath = segments.join('/');
+      const prefix = `${collPath}/`;
+      const directChildIds = () =>
+        [...new Set(
+          [...store.keys()]
+            .filter((p) => p.startsWith(prefix))
+            .map((p) => p.slice(prefix.length).split('/')[0]),
+        )].sort((a, b) => {
+          const numA = Number(a);
+          const numB = Number(b);
+          if (!Number.isNaN(numA) && !Number.isNaN(numB)) return numA - numB;
+          return a < b ? -1 : 1;
+        });
+
+      return {
+        path: collPath,
+        doc(id) {
+          return docRef([...segments, String(id)]);
+        },
+        async get() {
+          // Only list documents that actually exist, like real Firestore.
+          const docs = directChildIds()
+            .filter((id) => store.has([...segments, id].join('/')))
+            .map((id) => {
+              const ref = docRef([...segments, id]);
+              return {
+                id,
+                ref,
+                data: () => structuredClone(store.get(ref.path)),
+              };
+            });
+          return {
+            docs,
+            size: docs.length,
+            empty: docs.length === 0,
+            forEach(callback) {
+              docs.forEach(callback);
+            },
+          };
+        },
+        orderBy() {
+          return this;
+        },
+      };
+    };
+
+    return {
+      store,
+      deletedPaths,
+      batch() {
+        let operations = [];
+        return {
+          set(ref, data) {
+            operations.push([ref.path, data]);
+          },
+          async commit() {
+            for (const [refPath, data] of operations) {
+              store.set(refPath, structuredClone(data));
+            }
+            operations = [];
+          },
+        };
+      },
+      collection(name) {
+        return collectionRef([name]);
+      },
+    };
+  }
+
+  return { dbMock: createSyncFirestoreMock() };
+});
+
+vi.mock('firebase-admin/app', () => ({
+  cert: (input) => input,
+  getApps: () => [],
+  initializeApp: () => ({ mocked: true }),
+}));
+
+vi.mock('firebase-admin/firestore', () => ({
+  getFirestore: () => dbMock,
+}));
+
 import {
   parseArguments,
   parseChapterPath,
+  parseFrontmatter,
+  splitFrontmatter,
+  resolveChapterLocation,
+  resolveNovelId,
   extractTitle,
   countWords,
   deleteChapters,
+  deleteOrphanedChapters,
+  groupChaptersByNovel,
+  groupDeletedFilesByNovel,
   readChangedChapters,
+  scanExistingChapters,
+  syncChangedFiles,
   isInsideDir,
   chunk,
   MAX_FILE_SIZE,
 } from './sync-novel.js';
-import { buildNovelDocument } from '../utils/novelUtils.js';
+import { DEFAULT_NOVEL_ID, buildNovelDocument } from '../utils/novelUtils.js';
 
 // ---------------------------------------------------------------------------
 // parseArguments
@@ -29,12 +170,34 @@ describe('parseArguments', () => {
 
     expect(result).toEqual({
       novelDir: '../../novel',
+      novelId: 'psychic_petals',
       changedFiles: [
         'main/episode-01/01-the-classroom-intro.md',
         'main/episode-01/02-new-friend.md',
       ],
       deletedFiles: [],
     });
+  });
+
+  it('defaults --novel-id to psychic_petals when omitted', () => {
+    const result = parseArguments(['--novel-dir', '/tmp/test']);
+    expect(result.novelId).toBe('psychic_petals');
+  });
+
+  it('accepts a --novel-id override', () => {
+    const result = parseArguments(['--novel-dir', '/tmp/test', '--novel-id', 'other_novel']);
+    expect(result.novelId).toBe('other_novel');
+  });
+
+  it('trims whitespace around --novel-id', () => {
+    const result = parseArguments(['--novel-dir', '/tmp/test', '--novel-id', '  spaced_id  ']);
+    expect(result.novelId).toBe('spaced_id');
+  });
+
+  it('rejects an empty --novel-id value', () => {
+    expect(() => parseArguments(['--novel-dir', '/tmp/test', '--novel-id', ''])).toThrow(
+      '--novel-id must not be empty',
+    );
   });
 
   it('handles a single changed file', () => {
@@ -106,6 +269,7 @@ describe('parseArguments', () => {
 
     expect(result).toEqual({
       novelDir: '/tmp/test',
+      novelId: 'psychic_petals',
       changedFiles: ['main/episode-01/01-hello.md'],
       deletedFiles: [
         'main/episode-01/02-deleted.md',
@@ -171,8 +335,8 @@ describe('deleteChapters', () => {
     const result = await deleteChapters(mockNovelRef, files);
 
     expect(result).toEqual([
-      { episodeNumber: 1, chapterNumber: 2, slug: 'deleted' },
-      { episodeNumber: 2, chapterNumber: 1, slug: 'another' },
+      { language: 'en', episodeNumber: 1, chapterNumber: 2, slug: 'deleted' },
+      { language: 'en', episodeNumber: 2, chapterNumber: 1, slug: 'another' },
     ]);
     expect(deletedPaths).toEqual([
       { epId: '1', chId: '2' },
@@ -189,6 +353,7 @@ describe('parseChapterPath', () => {
     const result = parseChapterPath('main/episode-01/01-the-classroom-intro.md');
 
     expect(result).toEqual({
+      language: 'en',
       episodeNumber: 1,
       chapterNumber: 1,
       slug: 'the-classroom-intro',
@@ -199,6 +364,7 @@ describe('parseChapterPath', () => {
     const result = parseChapterPath('main/episode-12/42-a-deep-dive.md');
 
     expect(result).toEqual({
+      language: 'en',
       episodeNumber: 12,
       chapterNumber: 42,
       slug: 'a-deep-dive',
@@ -209,10 +375,47 @@ describe('parseChapterPath', () => {
     const result = parseChapterPath('main\\episode-03\\07-character-dev.md');
 
     expect(result).toEqual({
+      language: 'en',
       episodeNumber: 3,
       chapterNumber: 7,
       slug: 'character-dev',
     });
+  });
+
+  it('parses an explicit English-prefixed path', () => {
+    const result = parseChapterPath('main/en/episode-01/01-unlabeled-maps.md');
+
+    expect(result).toEqual({
+      language: 'en',
+      episodeNumber: 1,
+      chapterNumber: 1,
+      slug: 'unlabeled-maps',
+    });
+  });
+
+  it('parses a Tagalog-prefixed path', () => {
+    const result = parseChapterPath('main/tl/episode-02/03-mga-chords.md');
+
+    expect(result).toEqual({
+      language: 'tl',
+      episodeNumber: 2,
+      chapterNumber: 3,
+      slug: 'mga-chords',
+    });
+  });
+
+  it('accepts any two-letter lowercase language prefix', () => {
+    const result = parseChapterPath('main/ja/episode-05/11-some-slug.md');
+    expect(result).toMatchObject({ language: 'ja', episodeNumber: 5, chapterNumber: 11 });
+  });
+
+  it('rejects a three-letter directory segment as a language prefix', () => {
+    expect(parseChapterPath('main/eng/episode-01/01-intro.md')).toBeNull();
+    expect(parseChapterPath('main/subs/episode-01/01-intro.md')).toBeNull();
+  });
+
+  it('rejects an uppercase language prefix', () => {
+    expect(parseChapterPath('main/EN/episode-01/01-intro.md')).toBeNull();
   });
 
   it('returns null for a path outside the main directory', () => {
@@ -229,6 +432,143 @@ describe('parseChapterPath', () => {
 
   it('returns null for an empty path', () => {
     expect(parseChapterPath('')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveNovelId — language → Firestore document routing
+// ---------------------------------------------------------------------------
+describe('resolveNovelId', () => {
+  it('routes English to the base novel ID', () => {
+    expect(resolveNovelId('psychic_petals', 'en')).toBe('psychic_petals');
+  });
+
+  it('routes missing language (legacy bare paths) to the base novel ID', () => {
+    expect(resolveNovelId('psychic_petals', undefined)).toBe('psychic_petals');
+    expect(resolveNovelId('psychic_petals', '')).toBe('psychic_petals');
+  });
+
+  it('routes other languages to suffixed novel IDs', () => {
+    expect(resolveNovelId('psychic_petals', 'tl')).toBe('psychic_petals_tl');
+    expect(resolveNovelId('psychic_petals', 'ja')).toBe('psychic_petals_ja');
+  });
+
+  it('works with a custom base novel ID', () => {
+    expect(resolveNovelId('other_novel', 'tl')).toBe('other_novel_tl');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseFrontmatter — minimal YAML frontmatter parser
+// ---------------------------------------------------------------------------
+describe('parseFrontmatter', () => {
+  const stub = [
+    '---',
+    'title: Tahanan',
+    'episode: 1',
+    'chapter: 2',
+    'status: draft',
+    "translationOf: '1/2'",
+    '---',
+    '',
+    '# Tahanan',
+    '',
+    'Prose.',
+  ].join('\n');
+
+  it('parses all supported keys from a frontmatter block', () => {
+    expect(parseFrontmatter(stub)).toEqual({
+      title: 'Tahanan',
+      episode: 1,
+      chapter: 2,
+      status: 'draft',
+      translationOf: '1/2',
+    });
+  });
+
+  it('strips surrounding double quotes', () => {
+    const content = '---\ntitle: "Mga Chords"\n---\n\nBody.';
+    expect(parseFrontmatter(content).title).toBe('Mga Chords');
+  });
+
+  it('ignores unknown keys and blank lines inside the fence', () => {
+    const content = '---\nauthor: Someone\n\ntagline: hi\nstatus: draft\n---\nBody.';
+    expect(parseFrontmatter(content)).toEqual({ status: 'draft' });
+  });
+
+  it('skips keys without values instead of storing empty strings', () => {
+    const content = '---\ntitle:\nstatus: draft\n---\nBody.';
+    expect(parseFrontmatter(content)).toEqual({ status: 'draft' });
+  });
+
+  it('ignores non-numeric episode/chapter values', () => {
+    const content = '---\nepisode: two\nchapter: x2\n---\nBody.';
+    expect(parseFrontmatter(content)).toEqual({});
+    const partial = '---\nchapter: 2x\n---\nBody.';
+    expect(parseFrontmatter(partial)).toEqual({});
+  });
+
+  it('returns null when there is no frontmatter fence', () => {
+    expect(parseFrontmatter('# Just a heading\n\nBody.')).toBeNull();
+    expect(parseFrontmatter('')).toBeNull();
+  });
+
+  it('returns null when the fence is never closed', () => {
+    expect(parseFrontmatter('---\ntitle: Unclosed\n\nBody.')).toBeNull();
+  });
+
+  it('does not confuse a horizontal rule with a fence when not at start', () => {
+    const content = '# Title\n\n---\n\nSome section divider text.';
+    expect(parseFrontmatter(content)).toBeNull();
+  });
+});
+
+describe('splitFrontmatter', () => {
+  it('returns parsed metadata plus the body following the closing fence', () => {
+    const content = '---\ntitle: Tahanan\nstatus: draft\n---\n\n# Tahanan\n\nBody.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toEqual({ title: 'Tahanan', status: 'draft' });
+    expect(body).toBe('\n# Tahanan\n\nBody.');
+  });
+
+  it('leaves content untouched when there is no fence', () => {
+    const content = '# Just prose\n\n---\n\nA horizontal rule.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toBeNull();
+    expect(body).toBe(content);
+  });
+
+  it('leaves content untouched when the fence is never closed', () => {
+    const content = '---\ntitle: Unclosed\n\nBody.';
+    const { frontmatter, body } = splitFrontmatter(content);
+    expect(frontmatter).toBeNull();
+    expect(body).toBe(content);
+  });
+
+  it('keeps the full body including blank lines after the fence', () => {
+    const { frontmatter, body } = splitFrontmatter('---\ntitle: X\n---\n\n\nA.\n\nB.');
+    expect(frontmatter.title).toBe('X');
+    expect(body).toBe('\n\nA.\n\nB.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveChapterLocation — frontmatter precedence over path-derived numbers
+// ---------------------------------------------------------------------------
+describe('resolveChapterLocation', () => {
+  const pathLocation = { language: 'tl', episodeNumber: 1, chapterNumber: 2, slug: 'tahanan' };
+
+  it('keeps path-derived values when there is no frontmatter', () => {
+    expect(resolveChapterLocation(pathLocation, null)).toEqual(pathLocation);
+  });
+
+  it('keeps path-derived values for absent frontmatter keys', () => {
+    expect(resolveChapterLocation(pathLocation, { title: 'Tahanan' })).toEqual(pathLocation);
+  });
+
+  it('lets frontmatter override episode and chapter numbers', () => {
+    const merged = resolveChapterLocation(pathLocation, { episode: 3, chapter: 4 });
+    expect(merged).toEqual({ language: 'tl', episodeNumber: 3, chapterNumber: 4, slug: 'tahanan' });
   });
 });
 
@@ -425,6 +765,311 @@ describe('readChangedChapters', () => {
       warnSpy.mockRestore();
       await rm(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  it('reads a legacy English chapter without frontmatter and fills defaults', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'episode-01', '01-unlabeled-maps.md'),
+      '# Unlabeled Maps\n\nBody text.',
+    );
+
+    try {
+      const { chapters } = await readChangedChapters(novelDir, [
+        'main/episode-01/01-unlabeled-maps.md',
+      ]);
+
+      expect(chapters).toHaveLength(1);
+      expect(chapters[0]).toMatchObject({
+        language: 'en',
+        episodeNumber: 1,
+        chapterNumber: 1,
+        slug: 'unlabeled-maps',
+        title: 'Unlabeled Maps',
+        status: '',
+        translationOf: '',
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('gives frontmatter precedence over H1 heading and path-derived numbers', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'tl', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'tl', 'episode-01', '02-tahanan.md'),
+      [
+        '---',
+        'title: Tahanan',
+        'episode: 1',
+        'chapter: 2',
+        'status: draft',
+        'translationOf: 1/2',
+        '---',
+        '',
+        '# Wrong Heading That Must Lose',
+        '',
+        '*(Draft — hindi pa tapos.)*',
+      ].join('\n'),
+    );
+
+    try {
+      const { chapters } = await readChangedChapters(novelDir, [
+        'main/tl/episode-01/02-tahanan.md',
+      ]);
+
+      expect(chapters).toHaveLength(1);
+      expect(chapters[0]).toMatchObject({
+        language: 'tl',
+        episodeNumber: 1,
+        chapterNumber: 2,
+        slug: 'tahanan',
+        title: 'Tahanan',
+        status: 'draft',
+        translationOf: '1/2',
+      });
+      expect(chapters[0].content).toBe(
+        '\n# Wrong Heading That Must Lose\n\n*(Draft — hindi pa tapos.)*',
+      );
+      // Heading + placeholder words only; frontmatter tokens excluded.
+      expect(chapters[0].wordCount).toBe(
+        countWords('\n# Wrong Heading That Must Lose\n\n*(Draft — hindi pa tapos.)*'),
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the H1 title when frontmatter omits one', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'en', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'en', 'episode-01', '03-chords.md'),
+      '---\nstatus: draft\n---\n\n# Chords\n\nBody.',
+    );
+
+    try {
+      const { chapters } = await readChangedChapters(novelDir, [
+        'main/en/episode-01/03-chords.md',
+      ]);
+
+      expect(chapters[0]).toMatchObject({
+        language: 'en',
+        title: 'Chords',
+        status: 'draft',
+        translationOf: '',
+      });
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupChaptersByNovel / groupDeletedFilesByNovel — mixed-language routing
+// ---------------------------------------------------------------------------
+describe('groupChaptersByNovel', () => {
+  const enChapter = {
+    language: 'en',
+    episodeNumber: 1,
+    chapterNumber: 1,
+    slug: 'unlabeled-maps',
+    title: 'Unlabeled Maps',
+  };
+  const tlChapter = {
+    language: 'tl',
+    episodeNumber: 1,
+    chapterNumber: 1,
+    slug: 'mga-mapang-di-pinalagyan',
+    title: 'Mga Mapang Di-Pinalagyan',
+  };
+
+  it('splits a mixed en+tl run into per-novel buckets', () => {
+    const groups = groupChaptersByNovel([enChapter, tlChapter], 'psychic_petals');
+
+    expect(Object.keys(groups).sort()).toEqual(['psychic_petals', 'psychic_petals_tl']);
+    expect(groups.psychic_petals.language).toBe('en');
+    expect(groups.psychic_petals.chapters).toEqual([enChapter]);
+    expect(groups.psychic_petals_tl.language).toBe('tl');
+    expect(groups.psychic_petals_tl.chapters).toEqual([tlChapter]);
+  });
+
+  it('routes legacy bare-path chapters to the base novel', () => {
+    const groups = groupChaptersByNovel([{ ...enChapter, language: undefined }], 'psychic_petals');
+    expect(Object.keys(groups)).toEqual(['psychic_petals']);
+  });
+
+  it('returns no buckets for an empty chapter list', () => {
+    expect(groupChaptersByNovel([], 'psychic_petals')).toEqual({});
+  });
+
+  it('honours a custom base novel ID', () => {
+    const groups = groupChaptersByNovel([tlChapter], 'other_novel');
+    expect(Object.keys(groups)).toEqual(['other_novel_tl']);
+  });
+});
+
+describe('groupDeletedFilesByNovel', () => {
+  it('splits deletions by language prefix', () => {
+    const groups = groupDeletedFilesByNovel(
+      [
+        'main/en/episode-01/01-old.md',
+        'main/tl/episode-01/01-luma.md',
+        'main/episode-02/03-legacy.md',
+      ],
+      'psychic_petals',
+    );
+
+    expect(groups.psychic_petals.files.sort()).toEqual([
+      'main/en/episode-01/01-old.md',
+      'main/episode-02/03-legacy.md',
+    ]);
+    expect(groups.psychic_petals.language).toBe('en');
+    expect(groups.psychic_petals_tl).toEqual({ language: 'tl', files: ['main/tl/episode-01/01-luma.md'] });
+  });
+
+  it('skips unsupported paths instead of throwing', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const groups = groupDeletedFilesByNovel(['not-a-chapter.md'], 'psychic_petals');
+      expect(groups).toEqual({});
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scanExistingChapters — disk scan bucketed per resolved novel document
+// ---------------------------------------------------------------------------
+describe('scanExistingChapters', () => {
+  it('buckets existing chapter keys per language version', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    const novelDir = path.join(tempRoot, 'novel');
+    await mkdir(path.join(novelDir, 'main', 'en', 'episode-01'), { recursive: true });
+    await mkdir(path.join(novelDir, 'main', 'tl', 'episode-01'), { recursive: true });
+    await mkdir(path.join(novelDir, 'outlines', 'episode-01'), { recursive: true });
+    await writeFile(
+      path.join(novelDir, 'main', 'en', 'episode-01', '01-unlabeled-maps.md'),
+      '# Unlabeled Maps\n\nBody.',
+    );
+    await writeFile(
+      path.join(novelDir, 'main', 'tl', 'episode-01', '09-overridden.md'),
+      '---\nchapter: 3\n---\n\n# Na-override ng frontmatter.',
+    );
+    await writeFile(path.join(novelDir, 'main', 'tl', 'episode-01', '04-empty.md'), '');
+    await writeFile(path.join(novelDir, 'outlines', 'episode-01', '01-not-prose.md'), '# Outline');
+
+    try {
+      const keysByNovel = await scanExistingChapters(novelDir, 'psychic_petals');
+
+      expect([...keysByNovel.psychic_petals]).toEqual(['1-1']);
+      // The empty tl file registers nothing; the frontmatter chapter override
+      // remaps its file from 1-9 to 1-3.
+      expect([...keysByNovel.psychic_petals_tl]).toEqual(['1-3']);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an empty bucket map when main/ does not exist', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-'));
+    try {
+      expect(await scanExistingChapters(tempRoot, 'psychic_petals')).toEqual({});
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deleteOrphanedChapters — per-novel reconciliation
+// ---------------------------------------------------------------------------
+describe('deleteOrphanedChapters', () => {
+  function createMockNovelRef(episodesMap) {
+    const deletedPaths = [];
+    const episodeDocs = Object.entries(episodesMap).map(([epId, chapterIds]) => {
+      const deletedChapterIds = [];
+      const chaptersCollection = {
+        async get() {
+          return {
+            docs: chapterIds.map((chId) => ({
+              id: chId,
+              ref: { delete: async () => deletedChapterIds.push(chId) },
+            })),
+          };
+        },
+      };
+      return {
+        id: epId,
+        deletedChapterIds,
+        ref: {
+          collection(name) {
+            if (name === 'chapters') return chaptersCollection;
+            throw new Error(`Unexpected collection: ${name}`);
+          },
+        },
+      };
+    });
+
+    return {
+      deletedPaths,
+      episodeDocs,
+      collection(name) {
+        if (name === 'episodes') {
+          return {
+            async get() {
+              return { docs: episodeDocs.map(({ id, ref }) => ({ id, ref })) };
+            },
+          };
+        }
+        throw new Error(`Unexpected collection: ${name}`);
+      },
+    };
+  }
+
+  it('deletes only chapters missing from the existing-keys set', async () => {
+    const novelRef = createMockNovelRef({ 1: ['1', '2'], 2: ['1'] });
+    const existingKeys = new Set(['1-1', '2-1']);
+
+    const removed = await deleteOrphanedChapters(novelRef, existingKeys);
+
+    expect(removed).toEqual([{ episodeNumber: 1, chapterNumber: 2 }]);
+    expect(novelRef.episodeDocs[0].deletedChapterIds).toEqual(['2']);
+    expect(novelRef.episodeDocs[1].deletedChapterIds).toEqual([]);
+  });
+
+  it('skips non-numeric episode and chapter document IDs', async () => {
+    // Episode doc 'meta' and chapter doc 'x' are skipped entirely; the valid
+    // numeric chapter '2' is still reconciled against the (empty) key set.
+    const novelRef = createMockNovelRef({ meta: [], 1: ['x', '2'] });
+
+    const removed = await deleteOrphanedChapters(novelRef, new Set());
+
+    expect(removed).toEqual([{ episodeNumber: 1, chapterNumber: 2 }]);
+    expect(novelRef.episodeDocs.find((ep) => ep.id === '1').deletedChapterIds).toEqual(['2']);
+    expect(novelRef.episodeDocs.find((ep) => ep.id === 'meta').deletedChapterIds).toEqual([]);
+  });
+
+  it('isolates reconciliation per novel: another version’s keys never protect foreign docs', async () => {
+    // English novel has chapters 1-1 and 1-2; Tagalog novel has 1-1.
+    // The Tagalog key set contains ONLY 1-1 — it must not protect the
+    // English novel's 1-2, because each novel reconciles against its own set.
+    const englishRef = createMockNovelRef({ 1: ['1', '2'] });
+    const tagalogRef = createMockNovelRef({ 1: ['1'] });
+
+    const removedEn = await deleteOrphanedChapters(englishRef, new Set(['1-1']));
+    const removedTl = await deleteOrphanedChapters(tagalogRef, new Set(['1-1']));
+
+    expect(removedEn).toEqual([{ episodeNumber: 1, chapterNumber: 2 }]);
+    expect(removedTl).toEqual([]);
+    expect(englishRef.episodeDocs[0].deletedChapterIds).toEqual(['2']);
+    expect(tagalogRef.episodeDocs[0].deletedChapterIds).toEqual([]);
   });
 });
 
@@ -697,6 +1342,61 @@ describe('buildNovelDocument', () => {
       expect(doc.metadata.tags).toEqual(['sci-fi']);
       expect(doc.metadata.coverImage).toBe('');
     });
+
+    it('uses a custom novelId for the _id field when provided', () => {
+      const doc = buildNovelDocument({
+        currentData: {},
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+      });
+
+      expect(doc._id).toBe('psychic_petals_tl');
+    });
+
+    it('defaults the _id field to DEFAULT_NOVEL_ID', () => {
+      expect(DEFAULT_NOVEL_ID).toBe('psychic_petals');
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp, includeId: true });
+      expect(doc._id).toBe('psychic_petals');
+    });
+
+    it('includes the language field when explicitly provided', () => {
+      const doc = buildNovelDocument({
+        currentData: {},
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+        language: 'tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('preserves an existing language from current data when not overridden', () => {
+      const doc = buildNovelDocument({
+        currentData: { language: 'tl' },
+        timestamp: testTimestamp,
+        includeId: true,
+        novelId: 'psychic_petals_tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('lets an explicit language override the stored one', () => {
+      const doc = buildNovelDocument({
+        currentData: { language: 'en' },
+        timestamp: testTimestamp,
+        language: 'tl',
+      });
+
+      expect(doc.language).toBe('tl');
+    });
+
+    it('omits the language field when neither param nor current data provides it', () => {
+      const doc = buildNovelDocument({ currentData: {}, timestamp: testTimestamp, includeId: true });
+      expect('language' in doc).toBe(false);
+    });
   });
 
   describe('body path (API routes)', () => {
@@ -757,5 +1457,114 @@ describe('buildNovelDocument', () => {
       });
       expect(doc._id).toBeUndefined();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// syncChangedFiles — reconciliation guard against empty disk scans
+// ---------------------------------------------------------------------------
+describe('syncChangedFiles reconciliation guard', () => {
+  const originalConsole = { log: console.log, warn: console.warn };
+  let consoleCalls;
+
+  beforeAll(() => {
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY = Buffer.from(
+      JSON.stringify({ project_id: 'test-project' }),
+    ).toString('base64');
+  });
+
+  beforeEach(() => {
+    dbMock.store.clear();
+    dbMock.deletedPaths.length = 0;
+    consoleCalls = { log: [], warn: [] };
+    console.log = (...args) => consoleCalls.log.push(args);
+    console.warn = (...args) => consoleCalls.warn.push(args);
+  });
+
+  afterAll(() => {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+  });
+
+  /** Seed a populated base-novel database including stale leftovers. */
+  function seedNovel(novelId) {
+    dbMock.store.set(`novels/${novelId}/episodes/1/chapters/1`, {
+      wordCount: 5,
+      notes: 'api-managed',
+    });
+    dbMock.store.set(`novels/${novelId}/episodes/1/chapters/2`, { wordCount: 7 });
+    dbMock.store.set(`novels/${novelId}/episodes/1`, { episodeNumber: 1, totalWords: 12 });
+    dbMock.store.set(`novels/${novelId}/episodes/9`, { episodeNumber: 9 });
+    dbMock.store.set(`novels/${novelId}/episodes/9/chapters/3`, { wordCount: 99 });
+    dbMock.store.set(`novels/${novelId}`, { language: 'en' });
+  }
+
+  it('skips orphan reconciliation when the scan finds no chapters at all', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-guard-'));
+    // No main/ directory at all — a misdirected or broken checkout.
+    try {
+      seedNovel('psychic_petals');
+
+      await syncChangedFiles({
+        novelDir: tempRoot,
+        novelId: 'psychic_petals',
+        changedFiles: ['main/episode-01/01-gone.md'], // missing on disk -> explicit deletion
+        deletedFiles: [],
+      });
+
+      expect(
+        consoleCalls.warn.some((args) =>
+          args.some((a) => String(a).includes('Reconciliation skipped')),
+        ),
+      ).toBe(true);
+
+      // Explicit deletion of the reported file still ran…
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/1')).toBe(false);
+      // …but nothing else was wiped by the empty-scan reconciliation.
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/2')).toBe(true);
+      expect(dbMock.store.has('novels/psychic_petals/episodes/9/chapters/3')).toBe(true);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('still reconciles normally when the scan finds chapters', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-reconcile-'));
+    try {
+      await mkdir(path.join(tempRoot, 'main', 'episode-01'), { recursive: true });
+      await writeFile(
+        path.join(tempRoot, 'main', 'episode-01', '01-kept.md'),
+        '# Kept Chapter\n\none two three four five',
+      );
+      seedNovel('psychic_petals');
+
+      await syncChangedFiles({
+        novelDir: tempRoot,
+        novelId: 'psychic_petals',
+        changedFiles: ['main/episode-01/01-kept.md'],
+        deletedFiles: [],
+      });
+
+      expect(
+        consoleCalls.warn.some((args) =>
+          args.some((a) => String(a).includes('Reconciliation skipped')),
+        ),
+      ).toBe(false);
+
+      // Normal behavior preserved: kept chapter re-upserted (API fields
+      // intact), stale sibling purged as orphan, drained episode refreshed.
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/1')).toBe(true);
+      expect(dbMock.store.get('novels/psychic_petals/episodes/1/chapters/1').notes).toBe(
+        'api-managed',
+      );
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/2')).toBe(false);
+      expect(dbMock.store.has('novels/psychic_petals/episodes/9/chapters/3')).toBe(false);
+      expect(dbMock.store.get('novels/psychic_petals/episodes/1').totalWords).toBe(8); // '#', 'Kept', 'Chapter' + five words
+
+      // Root rollup sums the surviving episode totals.
+      expect(dbMock.store.get('novels/psychic_petals').metadata.totalWords).toBe(8);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 });
