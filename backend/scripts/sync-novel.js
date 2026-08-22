@@ -593,13 +593,12 @@ export async function upsertNovelDocument(novelRef, { language, timestamp } = {}
   return novelDoc;
 }
 
-async function main() {
-  const { novelDir, novelId, changedFiles, deletedFiles } = parseArguments(process.argv.slice(2));
-  if (changedFiles.length === 0 && deletedFiles.length === 0) {
-    console.log('No changed or deleted Markdown files supplied; nothing to sync.');
-    return;
-  }
-
+/**
+ * Sync pipeline shared by the CLI entry point and tests: route changed and
+ * deleted chapter files into their per-language novel documents, reconcile
+ * stored chapters against the disk scan, and refresh affected rollups.
+ */
+export async function syncChangedFiles({ novelDir, novelId, changedFiles, deletedFiles }) {
   const { chapters, extraDeletedFiles } = await readChangedChapters(novelDir, changedFiles);
   const allDeletedFiles = [...deletedFiles, ...extraDeletedFiles];
 
@@ -623,6 +622,21 @@ async function main() {
   // against its own slice so languages self-heal without clobbering each other.
   const keysByNovel = await scanExistingChapters(novelDir, novelId);
 
+  // A scan that produced no chapter keys at all means main/ is missing,
+  // empty, or holds no parseable chapters — almost always a wrong
+  // --novel-dir or a broken checkout rather than a deliberate wipe of every
+  // version. Reconciliation is skipped so a misdirected run cannot delete
+  // all stored chapters. Explicit per-file deletions below still apply, and
+  // any non-empty scan keeps reconciling normally (per-language empties
+  // included).
+  const scanHasAnyChapters = Object.keys(keysByNovel).length > 0;
+  if (!scanHasAnyChapters) {
+    console.warn(
+      'Reconciliation skipped: scan found no chapter files under main/. ' +
+        'Stored chapters will not be deleted.',
+    );
+  }
+
   for (const groupNovelId of targetNovelIds) {
     const language =
       chapterGroups[groupNovelId]?.language ?? deletionGroups[groupNovelId].language;
@@ -635,10 +649,9 @@ async function main() {
     );
 
     // Reconciliation: remove this novel's docs that no longer exist on disk
-    const orphanedChapters = await deleteOrphanedChapters(
-      novelRef,
-      keysByNovel[groupNovelId] ?? new Set(),
-    );
+    const orphanedChapters = scanHasAnyChapters
+      ? await deleteOrphanedChapters(novelRef, keysByNovel[groupNovelId] ?? new Set())
+      : [];
 
     // Upsert changed chapters into the correct subcollection paths:
     //   novels/{novelId}/episodes/{episodeNumber}/chapters/{chapterNumber}
@@ -665,6 +678,15 @@ async function main() {
       `Synced novels/${groupNovelId} (${language}): ${upsertedEpisodes.size > 0 ? chapterGroups[groupNovelId].chapters.length : 0} chapter(s) written, ${removedCount} chapter(s) removed (episodes: ${epLog}).`,
     );
   }
+}
+
+async function main() {
+  const { novelDir, novelId, changedFiles, deletedFiles } = parseArguments(process.argv.slice(2));
+  if (changedFiles.length === 0 && deletedFiles.length === 0) {
+    console.log('No changed or deleted Markdown files supplied; nothing to sync.');
+    return;
+  }
+  await syncChangedFiles({ novelDir, novelId, changedFiles, deletedFiles });
 }
 
 if (

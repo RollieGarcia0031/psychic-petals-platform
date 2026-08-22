@@ -1,7 +1,139 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll, beforeAll } from 'vitest';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Firestore mock harness for the syncChangedFiles pipeline tests — a minimal
+// in-memory document store mimicking the firebase-admin API subset used by
+// scripts/sync-novel.js. Defined inside vi.hoisted so the module mocks below
+// can reference it.
+// ---------------------------------------------------------------------------
+const { dbMock } = vi.hoisted(() => {
+  function createSyncFirestoreMock() {
+    const store = new Map();
+    const deletedPaths = [];
+
+    const docRef = (segments) => {
+      const docPath = segments.join('/');
+      return {
+        path: docPath,
+        id: segments[segments.length - 1],
+        async get() {
+          const exists = store.has(docPath);
+          return {
+            exists,
+            id: this.id,
+            data: () => (exists ? structuredClone(store.get(docPath)) : undefined),
+            ref: this,
+          };
+        },
+        async set(data, options) {
+          const merged =
+            options?.merge && store.has(docPath)
+              ? { ...store.get(docPath), ...structuredClone(data) }
+              : structuredClone(data);
+          store.set(docPath, merged);
+        },
+        async update(data) {
+          if (!store.has(docPath)) {
+            throw new Error(`update() on missing document: ${docPath}`);
+          }
+          store.set(docPath, { ...store.get(docPath), ...structuredClone(data) });
+        },
+        async delete() {
+          deletedPaths.push(docPath);
+          store.delete(docPath);
+        },
+        collection(name) {
+          return collectionRef([...segments, name]);
+        },
+      };
+    };
+
+    const collectionRef = (segments) => {
+      const collPath = segments.join('/');
+      const prefix = `${collPath}/`;
+      const directChildIds = () =>
+        [...new Set(
+          [...store.keys()]
+            .filter((p) => p.startsWith(prefix))
+            .map((p) => p.slice(prefix.length).split('/')[0]),
+        )].sort((a, b) => {
+          const numA = Number(a);
+          const numB = Number(b);
+          if (!Number.isNaN(numA) && !Number.isNaN(numB)) return numA - numB;
+          return a < b ? -1 : 1;
+        });
+
+      return {
+        path: collPath,
+        doc(id) {
+          return docRef([...segments, String(id)]);
+        },
+        async get() {
+          // Only list documents that actually exist, like real Firestore.
+          const docs = directChildIds()
+            .filter((id) => store.has([...segments, id].join('/')))
+            .map((id) => {
+              const ref = docRef([...segments, id]);
+              return {
+                id,
+                ref,
+                data: () => structuredClone(store.get(ref.path)),
+              };
+            });
+          return {
+            docs,
+            size: docs.length,
+            empty: docs.length === 0,
+            forEach(callback) {
+              docs.forEach(callback);
+            },
+          };
+        },
+        orderBy() {
+          return this;
+        },
+      };
+    };
+
+    return {
+      store,
+      deletedPaths,
+      batch() {
+        let operations = [];
+        return {
+          set(ref, data) {
+            operations.push([ref.path, data]);
+          },
+          async commit() {
+            for (const [refPath, data] of operations) {
+              store.set(refPath, structuredClone(data));
+            }
+            operations = [];
+          },
+        };
+      },
+      collection(name) {
+        return collectionRef([name]);
+      },
+    };
+  }
+
+  return { dbMock: createSyncFirestoreMock() };
+});
+
+vi.mock('firebase-admin/app', () => ({
+  cert: (input) => input,
+  getApps: () => [],
+  initializeApp: () => ({ mocked: true }),
+}));
+
+vi.mock('firebase-admin/firestore', () => ({
+  getFirestore: () => dbMock,
+}));
+
 import {
   parseArguments,
   parseChapterPath,
@@ -17,6 +149,7 @@ import {
   groupDeletedFilesByNovel,
   readChangedChapters,
   scanExistingChapters,
+  syncChangedFiles,
   isInsideDir,
   chunk,
   MAX_FILE_SIZE,
@@ -1324,5 +1457,114 @@ describe('buildNovelDocument', () => {
       });
       expect(doc._id).toBeUndefined();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// syncChangedFiles — reconciliation guard against empty disk scans
+// ---------------------------------------------------------------------------
+describe('syncChangedFiles reconciliation guard', () => {
+  const originalConsole = { log: console.log, warn: console.warn };
+  let consoleCalls;
+
+  beforeAll(() => {
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY = Buffer.from(
+      JSON.stringify({ project_id: 'test-project' }),
+    ).toString('base64');
+  });
+
+  beforeEach(() => {
+    dbMock.store.clear();
+    dbMock.deletedPaths.length = 0;
+    consoleCalls = { log: [], warn: [] };
+    console.log = (...args) => consoleCalls.log.push(args);
+    console.warn = (...args) => consoleCalls.warn.push(args);
+  });
+
+  afterAll(() => {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+  });
+
+  /** Seed a populated base-novel database including stale leftovers. */
+  function seedNovel(novelId) {
+    dbMock.store.set(`novels/${novelId}/episodes/1/chapters/1`, {
+      wordCount: 5,
+      notes: 'api-managed',
+    });
+    dbMock.store.set(`novels/${novelId}/episodes/1/chapters/2`, { wordCount: 7 });
+    dbMock.store.set(`novels/${novelId}/episodes/1`, { episodeNumber: 1, totalWords: 12 });
+    dbMock.store.set(`novels/${novelId}/episodes/9`, { episodeNumber: 9 });
+    dbMock.store.set(`novels/${novelId}/episodes/9/chapters/3`, { wordCount: 99 });
+    dbMock.store.set(`novels/${novelId}`, { language: 'en' });
+  }
+
+  it('skips orphan reconciliation when the scan finds no chapters at all', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-guard-'));
+    // No main/ directory at all — a misdirected or broken checkout.
+    try {
+      seedNovel('psychic_petals');
+
+      await syncChangedFiles({
+        novelDir: tempRoot,
+        novelId: 'psychic_petals',
+        changedFiles: ['main/episode-01/01-gone.md'], // missing on disk -> explicit deletion
+        deletedFiles: [],
+      });
+
+      expect(
+        consoleCalls.warn.some((args) =>
+          args.some((a) => String(a).includes('Reconciliation skipped')),
+        ),
+      ).toBe(true);
+
+      // Explicit deletion of the reported file still ran…
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/1')).toBe(false);
+      // …but nothing else was wiped by the empty-scan reconciliation.
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/2')).toBe(true);
+      expect(dbMock.store.has('novels/psychic_petals/episodes/9/chapters/3')).toBe(true);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('still reconciles normally when the scan finds chapters', async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'novel-sync-reconcile-'));
+    try {
+      await mkdir(path.join(tempRoot, 'main', 'episode-01'), { recursive: true });
+      await writeFile(
+        path.join(tempRoot, 'main', 'episode-01', '01-kept.md'),
+        '# Kept Chapter\n\none two three four five',
+      );
+      seedNovel('psychic_petals');
+
+      await syncChangedFiles({
+        novelDir: tempRoot,
+        novelId: 'psychic_petals',
+        changedFiles: ['main/episode-01/01-kept.md'],
+        deletedFiles: [],
+      });
+
+      expect(
+        consoleCalls.warn.some((args) =>
+          args.some((a) => String(a).includes('Reconciliation skipped')),
+        ),
+      ).toBe(false);
+
+      // Normal behavior preserved: kept chapter re-upserted (API fields
+      // intact), stale sibling purged as orphan, drained episode refreshed.
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/1')).toBe(true);
+      expect(dbMock.store.get('novels/psychic_petals/episodes/1/chapters/1').notes).toBe(
+        'api-managed',
+      );
+      expect(dbMock.store.has('novels/psychic_petals/episodes/1/chapters/2')).toBe(false);
+      expect(dbMock.store.has('novels/psychic_petals/episodes/9/chapters/3')).toBe(false);
+      expect(dbMock.store.get('novels/psychic_petals/episodes/1').totalWords).toBe(8); // '#', 'Kept', 'Chapter' + five words
+
+      // Root rollup sums the surviving episode totals.
+      expect(dbMock.store.get('novels/psychic_petals').metadata.totalWords).toBe(8);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
   });
 });
